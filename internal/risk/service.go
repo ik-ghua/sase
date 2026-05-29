@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ikuai8/sase/internal/data"
 	"github.com/ikuai8/sase/internal/dlp"
 )
 
@@ -19,12 +20,18 @@ type MutationFunc func(tenantID, subject, jti string, a Assessment)
 type subjectKey struct{ tenant, subject string }
 
 // Service 是控制面风险引擎:per (tenant,subject) 聚合信号、派生风险、突变即回调撤销。内存状态(起步)。
+// store 为**可选**持久化快照层(WithStore 注入;nil=纯内存现状):评分变更后 best-effort upsert 快照,
+// 失败不阻断评分(权威评分态仍在内存)。见 store.go。
 type Service struct {
 	mu    sync.Mutex
 	state map[subjectKey]*subjectState
 	onMut MutationFunc
 	now   func() time.Time
+	store data.Store // 可选;nil=不持久化(向后兼容既有 NewService 调用方)
 }
+
+// Option 配置 Service 的可选项(如 WithStore 注入持久化快照层)。
+type Option func(*Service)
 
 type subjectState struct {
 	factors map[string]Factor // 当前活跃因子(id→factor)
@@ -35,9 +42,14 @@ type subjectState struct {
 	firedJTI string
 }
 
-// NewService 构造风险服务。onMut 为突变(升入 critical)回调(可 nil)。
-func NewService(onMut MutationFunc) *Service {
-	return &Service{state: map[subjectKey]*subjectState{}, onMut: onMut, now: time.Now}
+// NewService 构造风险服务。onMut 为突变(升入 critical)回调(可 nil)。opts 为可选项(如 WithStore)。
+// 不带 opts 调用 = 纯内存现状(向后兼容既有调用方)。
+func NewService(onMut MutationFunc, opts ...Option) *Service {
+	s := &Service{state: map[subjectKey]*subjectState{}, onMut: onMut, now: time.Now}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // add/replace 因子并重算;升入 critical(或 critical 态下会话轮换)则触发 onMut。返回当前评估。
@@ -73,6 +85,11 @@ func (s *Service) observe(tenantID, subject, jti string, f Factor, sticky bool) 
 		st.firedJTI = ""
 	}
 	s.mu.Unlock()
+
+	// 旁路持久化快照(评分变更即刷新最新快照;在锁外做,失败不阻断评分)。仅在配置了快照层时。
+	if s.store != nil {
+		s.persistSnapshot(tenantID, subject, a)
+	}
 
 	if fire && s.onMut != nil {
 		s.onMut(tenantID, subject, target, a)

@@ -66,6 +66,7 @@ func TestPlatformAuditEndToEnd(t *testing.T) {
 		nil, // platform RBAC svc:本测覆盖 Slice39 平台审计,不走 RBAC
 		testIDPSvc(t, store, secSvc),
 		nil, nil, verifier, nil, nil,
+		nil, // riskSvc
 	)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()

@@ -147,6 +147,21 @@ paths:
       summary: 读本租户审计日志(只读;auditor 可读)
       responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AuditEntry' } } } } } }
 
+  /api/v1/tenants/{tid}/risk/{subject}:
+    parameters:
+      - { $ref: '#/components/parameters/Tid' }
+      - { name: subject, in: path, required: true, description: 主体(用户/设备身份), schema: { type: string } }
+    get:
+      tags: [risk]
+      summary: 取某主体最新风险评分快照(只读;platform_admin 经 path-tid RLS 可读任意租户)
+      description: |
+        风险引擎持久化快照层(评分变更后 best-effort upsert)。**权威评分态在内存**,本端点暴露最新落库快照。
+        快照持久化未启用 → 503;该主体无快照 → 404。
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/RiskScore' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { description: risk 服务未配置或快照持久化未启用 }
+
   /api/v1/tenants/{tid}/idp/configs:
     parameters: [ { $ref: '#/components/parameters/Tid' } ]
     post:
@@ -740,6 +755,21 @@ components:
         result:        { type: integer, description: "api 源=HTTP 码;data 源=0 哨兵" }
         detail:        { type: string }
         source:        { type: string, enum: [api, data], description: api=HTTP 中间件 / data=DB 触发器(原子) }
+    RiskScore:
+      type: object
+      description: 风险评分快照(risk_scores 一行;最新落库快照,权威评分态在内存)
+      properties:
+        subject:    { type: string }
+        score:      { type: integer, minimum: 0, maximum: 100, description: "0–100" }
+        level:      { type: string, enum: [low, medium, high, critical] }
+        factors:    { type: [array, "null"], items: { $ref: '#/components/schemas/RiskFactor' }, description: 可解释因子(可空) }
+        updated_at: { type: string, format: date-time, description: 快照落库时刻 }
+    RiskFactor:
+      type: object
+      description: 一个风险贡献因子(可解释性/审计)
+      properties:
+        id:     { type: string, description: "如 posture:jailbroken_rooted / dlp:身份证" }
+        weight: { type: integer, description: 对 score 的贡献 }
     SWGRule:
       type: object
       properties:

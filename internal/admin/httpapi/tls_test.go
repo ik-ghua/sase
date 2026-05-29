@@ -58,6 +58,7 @@ func TestAdminAPIServerTLS(t *testing.T) {
 		nil, // oidc deps
 		nil, // 限流器(测试不限流)
 		verifier, nil, nil,
+		nil, // riskSvc
 	)
 
 	ca, err := devpki.NewCA()

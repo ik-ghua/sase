@@ -615,6 +615,64 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tenants/{tid}/risk/{subject}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 租户 ID(UUID) */
+                tid: components["parameters"]["Tid"];
+                /** @description 主体(用户/设备身份) */
+                subject: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * 取某主体最新风险评分快照(只读;platform_admin 经 path-tid RLS 可读任意租户)
+         * @description 风险引擎持久化快照层(评分变更后 best-effort upsert)。**权威评分态在内存**,本端点暴露最新落库快照。
+         *     快照持久化未启用 → 503;该主体无快照 → 404。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description 租户 ID(UUID) */
+                    tid: components["parameters"]["Tid"];
+                    /** @description 主体(用户/设备身份) */
+                    subject: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RiskScore"];
+                    };
+                };
+                404: components["responses"]["NotFound"];
+                /** @description risk 服务未配置或快照持久化未启用 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tenants/{tid}/idp/configs": {
         parameters: {
             query?: never;
@@ -2573,6 +2631,28 @@ export interface components {
              * @enum {string}
              */
             source?: "api" | "data";
+        };
+        /** @description 风险评分快照(risk_scores 一行;最新落库快照,权威评分态在内存) */
+        RiskScore: {
+            subject?: string;
+            /** @description 0–100 */
+            score?: number;
+            /** @enum {string} */
+            level?: "low" | "medium" | "high" | "critical";
+            /** @description 可解释因子(可空) */
+            factors?: components["schemas"]["RiskFactor"][] | null;
+            /**
+             * Format: date-time
+             * @description 快照落库时刻
+             */
+            updated_at?: string;
+        };
+        /** @description 一个风险贡献因子(可解释性/审计) */
+        RiskFactor: {
+            /** @description 如 posture:jailbroken_rooted / dlp:身份证 */
+            id?: string;
+            /** @description 对 score 的贡献 */
+            weight?: number;
         };
         SWGRule: {
             /**

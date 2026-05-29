@@ -35,6 +35,7 @@ import (
 	"github.com/ikuai8/sase/internal/policy"
 	"github.com/ikuai8/sase/internal/ratelimit"
 	"github.com/ikuai8/sase/internal/resource"
+	"github.com/ikuai8/sase/internal/risk"
 	"github.com/ikuai8/sase/internal/secret"
 	"github.com/ikuai8/sase/internal/site"
 	"github.com/ikuai8/sase/internal/swg"
@@ -64,6 +65,8 @@ var AdminRoutePatterns = []string{
 	"POST /api/v1/tenants/{tid}/credentials",
 	"POST /api/v1/tenants/{tid}/credentials/revoke",
 	"GET /api/v1/tenants/{tid}/audit",
+	// 风险评分快照只读查询(risk RLS 持久化):某主体最新风险快照。handler 用 path tid 做 RLS 上下文。
+	"GET /api/v1/tenants/{tid}/risk/{subject}",
 	"POST /api/v1/tenants/{tid}/idp/configs",
 	"GET /api/v1/tenants/{tid}/idp/configs",
 	"GET /api/v1/tenants/{tid}/idp/configs/{cid}",
@@ -111,8 +114,8 @@ var AdminRoutePatterns = []string{
 }
 
 // Register 装配 Admin API 路由。
-// oidcDeps / popReg / platformAuditSvc / platformRBAC 均可为 nil(测试/无 PLATFORM_RW DSN):对应端点返 503(端点仍在,守住路由清单)。
-func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity.Service, policySvc policy.Service, resourceSvc resource.Service, auditSvc audit.Service, swgSvc swg.Service, siteSvc site.Service, fwSvc fw.Service, dlpSvc dlp.Service, enrollSvc enroll.Service, platformSvc platform.Service, popReg platform.PopRegistry, platformAuditSvc platformaudit.Service, platformRBAC platformrbac.Service, idpSvc idp.Service, oidcDeps *oidc.HandlerDeps, enrollLimiter *ratelimit.Limiter, verifier *cred.Verifier, adminActiveChecker authz.AdminActiveChecker, apiRec *metrics.APIRecorder) {
+// oidcDeps / popReg / platformAuditSvc / platformRBAC / riskSvc 均可为 nil(测试/无 PLATFORM_RW DSN):对应端点返 503(端点仍在,守住路由清单)。
+func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity.Service, policySvc policy.Service, resourceSvc resource.Service, auditSvc audit.Service, swgSvc swg.Service, siteSvc site.Service, fwSvc fw.Service, dlpSvc dlp.Service, enrollSvc enroll.Service, platformSvc platform.Service, popReg platform.PopRegistry, platformAuditSvc platformaudit.Service, platformRBAC platformrbac.Service, idpSvc idp.Service, oidcDeps *oidc.HandlerDeps, enrollLimiter *ratelimit.Limiter, verifier *cred.Verifier, adminActiveChecker authz.AdminActiveChecker, apiRec *metrics.APIRecorder, riskSvc *risk.Service) {
 	// 路由表(pattern → handler);键须与 AdminRoutePatterns 完全一致(下方 assert 守)。
 	handlers := map[string]http.Handler{
 		"POST /api/v1/tenants":                          createTenant(tenantSvc),
@@ -131,6 +134,8 @@ func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity
 		"POST /api/v1/tenants/{tid}/credentials":        issueCredential(identitySvc),
 		"POST /api/v1/tenants/{tid}/credentials/revoke": revokeCredential(identitySvc),
 		"GET /api/v1/tenants/{tid}/audit":               listAudit(auditSvc),
+		// 风险评分快照只读查询(risk RLS 持久化):riskSvc nil → 503;快照层未配 → 503;无快照 → 404。
+		"GET /api/v1/tenants/{tid}/risk/{subject}": getRiskScore(riskSvc),
 		// IdP 配置 CRUD(Slice36,secret 模块首个加密消费者:client_secret 经租户 DEK 加密落库)
 		"POST /api/v1/tenants/{tid}/idp/configs":         createIDPConfig(idpSvc),
 		"GET /api/v1/tenants/{tid}/idp/configs":          listIDPConfigs(idpSvc),
@@ -1054,6 +1059,33 @@ func listAudit(svc audit.Service) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, es)
+	}
+}
+
+// getRiskScore 返回某主体最新风险快照(risk RLS 持久化)。handler 用 **path tid 做 RLS 上下文**
+// (platform_admin TenantID 空,经 path-tid RLS 可读任意租户;对齐 listPolicies/listUsers 模式)。
+// authz 已守作用域:tenant_admin/auditor 限本租户、platform_admin 任意。
+// riskSvc nil(测试/未装配)或快照层未配(WithStore 未注入)→ 503;无快照 → 404;内部错脱敏(log + 通用文案)。
+func getRiskScore(riskSvc *risk.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if riskSvc == nil {
+			http.Error(w, "risk 服务未配置", http.StatusServiceUnavailable)
+			return
+		}
+		tid := r.PathValue("tid")
+		subject := r.PathValue("subject")
+		sc, err := riskSvc.GetScore(r.Context(), tid, subject)
+		switch {
+		case errors.Is(err, risk.ErrNoStore):
+			http.Error(w, "风险快照持久化未启用", http.StatusServiceUnavailable)
+		case errors.Is(err, risk.ErrNoScore):
+			http.Error(w, "该主体无风险快照", http.StatusNotFound)
+		case err != nil:
+			log.Printf("[admin] getRiskScore tid=%s subject=%s failed: %v", tid, subject, err)
+			http.Error(w, "查询风险快照失败", http.StatusInternalServerError)
+		default:
+			writeJSON(w, http.StatusOK, sc)
+		}
 	}
 }
 

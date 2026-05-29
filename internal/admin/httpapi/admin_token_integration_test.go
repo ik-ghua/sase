@@ -71,6 +71,7 @@ func TestAdminTokenIssuance(t *testing.T) {
 		nil, // platform RBAC svc
 		testIDPSvc(t, store, secSvc),
 		nil, nil, verifier, nil, nil,
+		nil, // riskSvc
 	)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()

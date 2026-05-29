@@ -111,7 +111,7 @@ func run() error {
 		} else {
 			log.Printf("[api-server] 风险突变撤销 tenant=%s sub=%s score=%d level=%s", tenantID, subject, a.Score, a.Level)
 		}
-	})
+	}, risk.WithStore(store)) // 持久化快照层:评分变更 best-effort upsert risk_scores(RLS);供只读查询端点。
 	identitySvc = identity.NewService(store, identity.WithSigner(signer), identity.WithRevocationNotifier(hub),
 		identity.WithRiskSource(func(tenantID, subject string) (int, string) { // 签发时取当前风险填 risk claim
 			a := riskSvc.Assess(tenantID, subject)
@@ -199,7 +199,7 @@ func run() error {
 	}
 	// Slice60:管理面 HTTP RED 指标(请求计数 + 时延);独立 registry,/metrics 另端口暴露(下方 goroutine)。
 	apiRec := metrics.NewAPIRecorder()
-	httpapi.Register(app.Mux(), tenantSvc, identitySvc, policySvc, resourceSvc, auditSvc, swgSvc, siteSvc, fwSvc, dlpSvc, enrollSvc, platformSvc, popReg, platformAuditSvc, platformRBACSvc, idpSvc, buildOIDCDeps(idpSvc, identitySvc, auditSvc), enrollLimiter, verifier, adminActiveChecker, apiRec)
+	httpapi.Register(app.Mux(), tenantSvc, identitySvc, policySvc, resourceSvc, auditSvc, swgSvc, siteSvc, fwSvc, dlpSvc, enrollSvc, platformSvc, popReg, platformAuditSvc, platformRBACSvc, idpSvc, buildOIDCDeps(idpSvc, identitySvc, auditSvc), enrollLimiter, verifier, adminActiveChecker, apiRec, riskSvc)
 
 	// /metrics 明文内部抓取(与 pop-agent/xds-server 对齐;运维 L2 3.10,客户不可见、数据不出域)。
 	go serveMetrics(ctx, envOr("SASE_API_METRICS_ADDR", ":9100"), apiRec.Handler())
