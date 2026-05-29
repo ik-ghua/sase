@@ -143,6 +143,7 @@ func run() error {
 		defer telConn.Close()
 		reporter := telemetry.NewReporter(telemetrypb.NewTelemetryClient(telConn), 1024)
 		go reporter.Run(ctx)
+		rec.RegisterTelemetryDrops(reporter.Dropped, reporter.DroppedSend) // /metrics 暴露遥测丢弃(背压/发送失败,Slice67)
 		dlpSink = reporter
 		log.Printf("[pop-agent] 遥测上报启用 → %s(DLP 命中跨进程喂风险引擎)", telAddr)
 	} else {
@@ -220,7 +221,7 @@ func run() error {
 	//    → dptunnel.Router 站点间转发 + **FWaaS L3/L4 真数据面裁决**。设 SDWAN_TUNNEL_ADDR(握手 TCP)
 	//    + SDWAN_DATA_ADDR(数据 UDP)启用;不设则不启(保持原行为)。身份权威=证书(tenant/site),非 srcAddr。
 	if hsAddr := os.Getenv("SDWAN_TUNNEL_ADDR"); hsAddr != "" {
-		if err := startSDWANTunnel(ctx, hsAddr, xdsAddr, tenantID, node, xdsTLS, serverTLS, siteReg); err != nil {
+		if err := startSDWANTunnel(ctx, hsAddr, xdsAddr, tenantID, node, xdsTLS, serverTLS, siteReg, rec); err != nil {
 			return err
 		}
 	}
@@ -256,7 +257,7 @@ func run() error {
 
 // startSDWANTunnel 起 SD-WAN 数据面隧道:FWStore + FW xDS 订阅 + dptunnel.Router(挂 FWaaS)+ UDP 数据面 +
 // tunhandshake 握手服务。握手成功(证书认证 → tenant/site)→ 建会话 → Router.Register(身份来自证书)。
-func startSDWANTunnel(ctx context.Context, hsAddr, xdsAddr, tenantID, node string, xdsTLS, serverTLS *tls.Config, siteReg *siteCIDRs) error {
+func startSDWANTunnel(ctx context.Context, hsAddr, xdsAddr, tenantID, node string, xdsTLS, serverTLS *tls.Config, siteReg *siteCIDRs, rec *metrics.Recorder) error {
 	dataAddr := envOr("SDWAN_DATA_ADDR", ":7100")
 	alg := envOr("SDWAN_TUNNEL_ALG", dptunnel.AlgChaCha20Poly1305)
 
@@ -270,7 +271,8 @@ func startSDWANTunnel(ctx context.Context, hsAddr, xdsAddr, tenantID, node strin
 	})
 
 	router := dptunnel.NewRouter()
-	router.SetFirewall(fwStore) // FWaaS L3/L4 在站点间转发前裁决(须在 Serve 前设)
+	router.SetFirewall(fwStore)        // FWaaS L3/L4 在站点间转发前裁决(须在 Serve 前设)
+	router.SetDropHook(rec.TunnelDrop) // 数据面隧道丢包计数 → /metrics(按原因,Slice67;须在 Serve 前设)
 	dataConn, err := net.ListenPacket("udp", dataAddr)
 	if err != nil {
 		return fmt.Errorf("监听 SD-WAN 数据面 %s: %w", dataAddr, err)

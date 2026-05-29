@@ -224,3 +224,32 @@ func TestRouterFirewallSegmentation(t *testing.T) {
 		t.Fatalf("tcp:22 应被防火墙丢弃,却转发 %d 条", len(out))
 	}
 }
+
+// Slice67:丢包钩子按原因计量——未注册源→no_session;防火墙拒→firewall_deny(镜像会话正常 Open)。
+func TestRouterDropHook(t *testing.T) {
+	var reasons []string
+	router := NewRouter()
+	router.SetFirewall(fwAllow80{}) // 只放行 tcp:80
+	router.SetDropHook(func(r string) { reasons = append(reasons, r) })
+
+	// ① 未注册源 → no_session
+	router.Handle([]byte("x"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40501})
+
+	// ② 注册 siteA/siteB + 镜像发送会话(同密钥反方向,可正常 Open);tcp:22 被防火墙拒 → firewall_deny
+	addrA := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40502}
+	addrB := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40503}
+	router.Register("t1", "siteA", NewSession(mustAEAD(t, key32(0xA1)), 1, 1, 0), addrA, []*net.IPNet{cidr(t, "10.1.0.0/24")})
+	router.Register("t1", "siteB", NewSession(mustAEAD(t, key32(0xB2)), 1, 1, 0), addrB, []*net.IPNet{cidr(t, "10.2.0.0/24")})
+	sendA := NewSession(mustAEAD(t, key32(0xA1)), 1, 0, 1)
+	f22, _ := sendA.Seal(ipv4TCP("10.1.0.5", "10.2.0.9", 22))
+	router.Handle(f22[0], addrA)
+
+	// ③ tcp:80 过防火墙但目的 10.9.0.9 不在任何租户路由 → no_route
+	f80, _ := sendA.Seal(ipv4TCP("10.1.0.5", "10.9.0.9", 80))
+	router.Handle(f80[0], addrA)
+
+	want := []string{"no_session", "firewall_deny", "no_route"}
+	if len(reasons) != len(want) || reasons[0] != want[0] || reasons[1] != want[1] || reasons[2] != want[2] {
+		t.Fatalf("丢包原因应 %v,得 %v", want, reasons)
+	}
+}

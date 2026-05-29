@@ -46,6 +46,7 @@ type Router struct {
 	bySrc    map[string]*siteEntry   // udp src addr → 站点(入向解复用)
 	byTenant map[string][]*siteEntry // 租户 → 站点(选路,租户内 LPM)
 	fw       Firewall                // 可选 FWaaS 钩子(SetFirewall 设;须在 Serve 前设,之后只读)
+	onDrop   func(reason string)     // 可选丢包计数钩子(SetDropHook 设;数据面可观测,Slice67)
 }
 
 // NewRouter 构造路由器。
@@ -57,6 +58,14 @@ func NewRouter() *Router {
 func (r *Router) SetFirewall(fw Firewall) {
 	r.mu.Lock()
 	r.fw = fw
+	r.mu.Unlock()
+}
+
+// SetDropHook 挂丢包计数钩子(按原因计量,供 /metrics 暴露数据面隧道丢弃可观测,Slice67)。
+// 须在 Serve 前设、之后只读(同 fw);nil = 不计量。
+func (r *Router) SetDropHook(fn func(reason string)) {
+	r.mu.Lock()
+	r.onDrop = fn
 	r.mu.Unlock()
 }
 
@@ -101,31 +110,43 @@ type Outbound struct {
 func (r *Router) Handle(datagram []byte, src net.Addr) []Outbound {
 	r.mu.RLock()
 	from := r.bySrc[src.String()]
-	fw := r.fw // 同锁读取,与 SetFirewall 无竞争
+	fw := r.fw         // 同锁读取,与 SetFirewall 无竞争
+	onDrop := r.onDrop // 同上(Slice67 丢包计数;设于 Serve 前)
 	r.mu.RUnlock()
+	drop := func(reason string) {
+		if onDrop != nil {
+			onDrop(reason)
+		}
+	}
 	if from == nil {
-		return nil // 未注册源(NAT 下需 receiver-index,待握手)
+		drop("no_session") // 未注册源(NAT 下需 receiver-index,待握手)
+		return nil
 	}
 	inners, err := from.sess.Open(datagram)
 	if err != nil {
+		drop("decrypt_fail") // AEAD 解封失败(伪造源无密钥 / 损坏帧)
 		return nil
 	}
 	var out []Outbound
 	for _, pkt := range inners {
 		tuple, ok := parse5Tuple(pkt)
 		if !ok {
+			drop("parse_fail")
 			continue
 		}
 		// FWaaS L3/L4 裁决(每租户分段):deny → 丢弃,不转发
 		if fw != nil && !fw.Allow(from.tenant, tuple) {
+			drop("firewall_deny")
 			continue
 		}
 		to := r.route(from.tenant, tuple.DstIP) // 仅在源租户内选路(跨租户隔离)
 		if to == nil || to == from {
-			continue // 无路由 / 自指 → 丢弃
+			drop("no_route") // 无路由 / 自指 → 丢弃
+			continue
 		}
 		frames, err := to.sess.Seal(pkt)
 		if err != nil {
+			drop("seal_fail")
 			continue
 		}
 		for _, f := range frames {

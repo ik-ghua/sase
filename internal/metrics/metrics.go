@@ -30,9 +30,10 @@ const (
 
 // Recorder 持 PoP 接入面指标。nil Recorder 的方法为 no-op(便于未接入时跑)。
 type Recorder struct {
-	reg      *prometheus.Registry
-	access   *prometheus.CounterVec
-	upstream prometheus.Histogram
+	reg         *prometheus.Registry
+	access      *prometheus.CounterVec
+	upstream    prometheus.Histogram
+	tunnelDrops *prometheus.CounterVec // SD-WAN 数据面隧道丢包(按原因,Slice67)
 }
 
 // NewRecorder 构造带独立 registry 的指标记录器。
@@ -46,14 +47,58 @@ func NewRecorder() *Recorder {
 		Namespace: "sase", Subsystem: "pop", Name: "upstream_seconds",
 		Help: "经反向通道到应用的往返耗时(秒)", Buckets: prometheus.DefBuckets,
 	})
-	reg.MustRegister(access, upstream)
-	return &Recorder{reg: reg, access: access, upstream: upstream}
+	tunnelDrops := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "sase", Subsystem: "pop", Name: "tunnel_drops_total",
+		Help: "SD-WAN 数据面隧道丢包数(按原因:no_session/decrypt_fail/parse_fail/firewall_deny/no_route/seal_fail)",
+	}, []string{"reason"})
+	reg.MustRegister(access, upstream, tunnelDrops)
+	return &Recorder{reg: reg, access: access, upstream: upstream, tunnelDrops: tunnelDrops}
 }
 
 // Access 记一次接入结果。
 func (r *Recorder) Access(outcome string) {
 	if r != nil {
 		r.access.WithLabelValues(outcome).Inc()
+	}
+}
+
+// TunnelDrop 记一次数据面隧道丢包(nil 为 no-op)。reason 低基数(有界 6 种,见 dptunnel.Router)。
+func (r *Recorder) TunnelDrop(reason string) {
+	if r != nil {
+		r.tunnelDrops.WithLabelValues(reason).Inc()
+	}
+}
+
+// TunnelDropValue 返回某 reason 的隧道丢包计数(测试/自检用;未发生返 0)。
+func (r *Recorder) TunnelDropValue(reason string) float64 {
+	c, err := r.tunnelDrops.GetMetricWithLabelValues(reason)
+	if err != nil {
+		return 0
+	}
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		return 0
+	}
+	return m.GetCounter().GetValue()
+}
+
+// RegisterTelemetryDrops 把遥测 Reporter 的丢弃计数(背压满 / 发送失败)以 CounterFunc 暴露
+// (scrape 时读 atomic;不改 Reporter)。nil Recorder / nil func 为 no-op。
+func (r *Recorder) RegisterTelemetryDrops(enqueueDropped, sendDropped func() int64) {
+	if r == nil {
+		return
+	}
+	if enqueueDropped != nil {
+		r.reg.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Namespace: "sase", Subsystem: "pop", Name: "telemetry_enqueue_dropped_total",
+			Help: "遥测事件入队满丢弃数(背压兜底)",
+		}, func() float64 { return float64(enqueueDropped()) }))
+	}
+	if sendDropped != nil {
+		r.reg.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Namespace: "sase", Subsystem: "pop", Name: "telemetry_send_dropped_total",
+			Help: "遥测事件发送失败丢弃数(控制面不可达等;运维需知丢了多少风险信号)",
+		}, func() float64 { return float64(sendDropped()) }))
 	}
 }
 

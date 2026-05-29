@@ -98,3 +98,41 @@ func TestHTTPMiddleware(t *testing.T) {
 		t.Fatalf("nil recorder 应透传,得 %d", rr.Code)
 	}
 }
+
+// Slice67:隧道丢包按 reason 计数 + nil no-op。
+func TestTunnelDrop(t *testing.T) {
+	r := NewRecorder()
+	r.TunnelDrop("no_route")
+	r.TunnelDrop("no_route")
+	r.TunnelDrop("firewall_deny")
+	if got := r.TunnelDropValue("no_route"); got != 2 {
+		t.Fatalf("no_route 应 2,得 %v", got)
+	}
+	if got := r.TunnelDropValue("firewall_deny"); got != 1 {
+		t.Fatalf("firewall_deny 应 1,得 %v", got)
+	}
+	if got := r.TunnelDropValue("never"); got != 0 {
+		t.Fatalf("未发生 reason 应 0,得 %v", got)
+	}
+	var nilRec *Recorder
+	nilRec.TunnelDrop("x") // 不应 panic
+}
+
+// Slice67:遥测丢弃 CounterFunc 经 /metrics 暴露 atomic 当前值(scrape 时读)。
+func TestRegisterTelemetryDrops(t *testing.T) {
+	r := NewRecorder()
+	var enq, snd int64
+	r.RegisterTelemetryDrops(func() int64 { return enq }, func() int64 { return snd })
+	enq, snd = 3, 5 // 注册后变化,scrape 时反映
+	rr := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rr.Body.String()
+	if !strings.Contains(body, "sase_pop_telemetry_enqueue_dropped_total 3") {
+		t.Fatalf("/metrics 应含 enqueue dropped=3,得:\n%s", body)
+	}
+	if !strings.Contains(body, "sase_pop_telemetry_send_dropped_total 5") {
+		t.Fatalf("/metrics 应含 send dropped=5,得:\n%s", body)
+	}
+	var nilRec *Recorder
+	nilRec.RegisterTelemetryDrops(nil, nil) // 不应 panic
+}
