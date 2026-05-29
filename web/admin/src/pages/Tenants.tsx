@@ -39,6 +39,9 @@ const { Title } = Typography;
 type TenantSummary = components['schemas']['TenantSummary'];
 type Tenant = components['schemas']['Tenant'];
 type TenantPatch = components['schemas']['TenantPatch'];
+type User = components['schemas']['User'];
+type CompileResult = components['schemas']['CompileResult'];
+type Policy = components['schemas']['Policy'];
 
 // status → Tag 颜色映射(与后端枚举对齐:Slice 33b/c)
 const STATUS_COLORS: Record<string, string> = {
@@ -92,6 +95,36 @@ async function cancelDecommission(tid: string): Promise<Tenant> {
   );
   if (error || !response.ok) throw toApiError(response, error);
   return data as Tenant;
+}
+
+// Slice57:租户详情深化——platform_admin 读目标租户的用户/激活策略。
+// 后端 handler 用 path tid 做 RLS 上下文(与 caller 角色无关),故 platform_admin 可读任意租户。
+async function fetchTenantUsers(tid: string): Promise<User[]> {
+  const { data, error, response } = await client.GET('/api/v1/tenants/{tid}/users', {
+    params: { path: { tid } },
+  });
+  if (error || !response.ok) throw toApiError(response, error);
+  return data ?? [];
+}
+
+// 激活策略只有 bundle 摘要可读(version/hash);无 GET 策略明细列表(待后端加)。
+// 无激活 bundle 时后端 404 → 返 null(UI 显示「无激活策略」)。
+async function fetchTenantBundle(tid: string): Promise<CompileResult | null> {
+  const { data, error, response } = await client.GET('/api/v1/tenants/{tid}/policies/bundle', {
+    params: { path: { tid } },
+  });
+  if (response.status === 404) return null;
+  if (error || !response.ok) throw toApiError(response, error);
+  return (data as CompileResult) ?? null;
+}
+
+// 编写态策略列表(Slice58 后端补 GET /policies)。
+async function fetchTenantPolicies(tid: string): Promise<Policy[]> {
+  const { data, error, response } = await client.GET('/api/v1/tenants/{tid}/policies', {
+    params: { path: { tid } },
+  });
+  if (error || !response.ok) throw toApiError(response, error);
+  return data ?? [];
 }
 
 function formatDate(s?: string | null): string {
@@ -221,6 +254,24 @@ export default function Tenants() {
   });
 
   const invalidate = () => qc.invalidateQueries({ queryKey: ['platform-tenants'] });
+
+  // Slice57:Drawer 打开时懒加载目标租户的用户/激活策略(enabled 跟 detailTarget;关闭即停)。
+  const detailTid = detailTarget?.id ?? '';
+  const usersQuery = useQuery({
+    queryKey: ['tenant-users', detailTid],
+    queryFn: () => fetchTenantUsers(detailTid),
+    enabled: detailTid !== '',
+  });
+  const bundleQuery = useQuery({
+    queryKey: ['tenant-bundle', detailTid],
+    queryFn: () => fetchTenantBundle(detailTid),
+    enabled: detailTid !== '',
+  });
+  const policiesQuery = useQuery({
+    queryKey: ['tenant-policies', detailTid],
+    queryFn: () => fetchTenantPolicies(detailTid),
+    enabled: detailTid !== '',
+  });
 
   // 回填编辑表单(PATCH 基线):name/plan/quota 显示当前值,status 仅 active/suspended 可选。
   const fillForm = useCallback(
@@ -462,6 +513,101 @@ export default function Tenants() {
                   </Space>
                 )}
               </>
+            )}
+
+            {/* Slice57:用户 + 激活策略(只读;platform_admin 经 path-tid RLS 读目标租户;所有状态可见)*/}
+            <Divider>用户</Divider>
+            {usersQuery.isError ? (
+              <Alert
+                type="error"
+                showIcon
+                message="读取用户失败"
+                description={usersQuery.error instanceof Error ? usersQuery.error.message : undefined}
+              />
+            ) : (
+              <Table<User>
+                rowKey={(u) => u.id ?? u.external_id ?? ''}
+                size="small"
+                loading={usersQuery.isFetching}
+                dataSource={usersQuery.data ?? []}
+                pagination={{ pageSize: 5, hideOnSinglePage: true, size: 'small' }}
+                columns={[
+                  {
+                    title: '外部 ID',
+                    dataIndex: 'external_id',
+                    key: 'external_id',
+                    ellipsis: true,
+                    render: (v?: string) => v || '-',
+                  },
+                  {
+                    title: '邮箱',
+                    dataIndex: 'email',
+                    key: 'email',
+                    ellipsis: true,
+                    render: (v?: string) => v || '-',
+                  },
+                  {
+                    title: '状态',
+                    dataIndex: 'status',
+                    key: 'status',
+                    width: 90,
+                    render: (s?: string) => (
+                      <Tag color={s === 'active' ? 'success' : 'default'}>{s ?? '-'}</Tag>
+                    ),
+                  },
+                ]}
+              />
+            )}
+
+            <Divider>策略</Divider>
+            {/* 激活版本(编译产物摘要;404/未编译 → 无激活策略)*/}
+            <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
+              {bundleQuery.data && bundleQuery.data.version
+                ? `激活版本 v${bundleQuery.data.version} · hash ${(bundleQuery.data.content_hash ?? '').slice(0, 12)}`
+                : bundleQuery.isFetching
+                  ? '激活版本加载中…'
+                  : '无激活策略(未编译/未激活)'}
+            </Typography.Paragraph>
+            {/* 编写态策略列表(Slice58)*/}
+            {policiesQuery.isError ? (
+              <Alert
+                type="error"
+                showIcon
+                message="读取策略失败"
+                description={
+                  policiesQuery.error instanceof Error ? policiesQuery.error.message : undefined
+                }
+              />
+            ) : (
+              <Table<Policy>
+                rowKey={(p) => p.id ?? ''}
+                size="small"
+                loading={policiesQuery.isFetching}
+                dataSource={policiesQuery.data ?? []}
+                pagination={{ pageSize: 5, hideOnSinglePage: true, size: 'small' }}
+                columns={[
+                  { title: '优先级', dataIndex: 'priority', key: 'priority', width: 70 },
+                  {
+                    title: '主体',
+                    key: 'subject',
+                    ellipsis: true,
+                    render: (_, p) => `${p.subject_kind ?? ''}${p.subject_value ? ':' + p.subject_value : ''}` || '-',
+                  },
+                  { title: '资源', dataIndex: 'resource', key: 'resource', ellipsis: true, render: (v?: string) => v || '-' },
+                  { title: '动作', dataIndex: 'action', key: 'action', width: 80, render: (v?: string) => v || '-' },
+                  {
+                    title: '效果',
+                    dataIndex: 'effect',
+                    key: 'effect',
+                    width: 90,
+                    render: (e?: string) => (
+                      <Tag color={e === 'allow' ? 'success' : e === 'deny' ? 'error' : 'warning'}>
+                        {e ?? '-'}
+                      </Tag>
+                    ),
+                  },
+                ]}
+              />
             )}
           </>
         )}

@@ -11,6 +11,8 @@
 - **Slice 47**:**平台审计页**(只读);`Audit.tsx` GET /platform/audit?limit=N;双层审计 source api(handler)/data(DB 触发器,result=0 显示「触发器」哨兵);source/result Tag 色彩区分;limit 选择器 + 时间倒序排序 + 来源筛选。**4/5**
 - **Slice 48**:**管理员令牌签发页**;`AdminTokens.tsx` POST /platform/admin-tokens;role 选择(tenant_admin/auditor 需 tenant_id;platform_admin 无 tenant_id 须已登记);**token 只显示一次**(签发 Modal + 复制按钮 + 提醒);403(subject 不在表)/503(RBAC 未配)可读提示。**5/5 菜单页全完成**
 - **Slice 50(g)**:**租户详情 + PATCH + 注销/取消**(租户页从只读升为可操作);`Tenants.tsx` 加「详情」操作列 → Drawer:Descriptions 详情 + 编辑表单(PATCH `/tenants/{tid}`,**只发改动字段** `buildPatch` diff;配额留空=不改、0=限死、暂不能改回「不限」LP-PC1)+ 生命周期(注销 POST `.../decommission` 可选 grace_hours、取消 POST `.../decommission/cancel`);按 status 门控操作(active/suspended 可编辑+可注销;offboarding 显示取消注销;decommissioned 终态只读)。Vitest 40/40(新增 6:Drawer 打开 / PATCH 只发改动 / 无修改不调用 / 注销 body 空 / offboarding 取消按钮 / decommissioned 终态)
+- **Slice 57**:**租户详情深化**(Drawer 加用户列表 + 激活策略摘要);`GET /tenants/{tid}/users` + `/policies/bundle`(404→「无激活策略」),Drawer 打开懒加载;**platform_admin 经 path-tid RLS 读目标租户**(handler 用 path tid 非 caller TenantID)。Vitest 41/41 + 真 Chromium e2e(TenantA 用户 ua@a.com)。
+- **Slice 58**:**策略明细列表**(补 Slice57 缺口);后端加 `GET /tenants/{tid}/policies`(`policy.ListByTenant`,RLS),前端 Drawer「策略」区显激活版本摘要 + 编写态策略 Table(优先级/主体/资源/动作/效果)。后端 `-race` 测(含 RLS 跨租户隔离)+ 前端 41/41 + e2e
 
 ## 技术栈
 - **React 18** + **TypeScript 5.5(strict)** + **Vite 5**

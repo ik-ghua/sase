@@ -338,7 +338,30 @@ export interface paths {
             };
             cookie?: never;
         };
-        get?: never;
+        /** 列出本租户编写态策略(Slice58;platform_admin 经 path-tid RLS 可读任意租户) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description 租户 ID(UUID) */
+                    tid: components["parameters"]["Tid"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Policy"][];
+                    };
+                };
+            };
+        };
         put?: never;
         /** 创建策略(编写态) */
         post: {
@@ -1338,7 +1361,7 @@ export interface paths {
          *       - `tenant_admin` / `auditor` — **必带 `tenant_id`**(作用域租户;审计落 target tenant);
          *       - `platform_admin`(Slice38c)— **必查 `platform_admins` 表 IsActive(subject)** + **必空 `tenant_id`**(跨租户);
          *         subject 不在表/disabled → 403;RBAC 服务未配置(SASE_DB_PLATFORM_RW_DSN 未设)→ 503;**bootstrap env 绕过本表**(应急通道,生产应立即用该令牌 POST /platform/admins 登记自己)。
-         *     **disable/delete platform_admin 不即时撤销已签出令牌**:剩余 TTL(≤12h)内仍有效;即时吊销需后续刀建 admin 令牌撤销表。
+         *     **disable/delete platform_admin 即时撤销已签出令牌(Slice56)**:authz 中间件对 platform_admin 令牌**每请求复查 IsActive(subject)**,disable/delete 后该 subject 令牌即 401(无需等 TTL)。bootstrap 豁免(不在表)。**注**:撤销基于当前 active 状态(非按签发时刻),故 disable 后再 enable / delete 后再建同名 subject 会使旧令牌恢复有效——属有意运维动作。
          *     **detail 审计只记 subject+role,不记 token**(凭证泄露面)。生产终态应走 IdP→换令牌。
          */
         post: {
@@ -1769,9 +1792,8 @@ export interface paths {
         post?: never;
         /**
          * 删除 platform_admin(**禁止删除自己**防锁死;disable 也不可)
-         * @description **delete 不即时撤销已签出的 platform_admin token**:剩余 TTL(≤12h)内仍有效;
-         *     即时吊销需后续刀建 admin 令牌撤销表。
-         *     **B5 防自助锁死**:删自己被拒(400)。删他人后,该 subject 后续无法再签发 platform_admin token。
+         * @description **delete 即时撤销已签出令牌(Slice56)**:authz 每请求复查 IsActive,delete 后该 subject 令牌即 401(无需等 TTL)。
+         *     **防自助锁死**:删自己被拒(400)。**last-admin 保护(Slice55)**:删表内最后一枚 active 平台管理员被拒(400,事务内 FOR UPDATE 计数,防 TOCTOU)。删他人后,该 subject 后续无法再签发 platform_admin token。
          */
         delete: {
             parameters: {
@@ -1825,9 +1847,8 @@ export interface paths {
         head?: never;
         /**
          * 更新 platform_admin(status / email);subject 不可改
-         * @description **disable 不即时撤销已签出的 platform_admin token**:剩余 TTL(≤12h)内仍有效;
-         *     即时吊销需后续刀建 admin 令牌撤销表(对照 ZTNA 凭证撤销机制)。
-         *     **B5 防自助锁死**:disable 自己被拒(400);请请另一名 platform_admin 操作,或后续做 last-admin 检查。
+         * @description **disable 即时撤销已签出令牌(Slice56)**:authz 每请求复查 IsActive,disable 后该 subject 令牌即 401(无需等 TTL)。
+         *     **防自助锁死**:disable 自己被拒(400);**last-admin 保护(Slice55)**:disable 表内最后一枚 active 平台管理员被拒(400,事务内 FOR UPDATE 计数,防 TOCTOU),防停用至 0 active 锁死。
          */
         patch: {
             parameters: {

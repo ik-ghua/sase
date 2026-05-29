@@ -43,6 +43,12 @@ test('登录 → 租户页 → 详情 Drawer → PoP 写操作(浏览器真跑)'
   await expect(page.getByText('生命周期')).toBeVisible();
   // 编辑表单应预填当前值(afterOpenChange 回填;首行=TenantA)
   await expect(page.getByPlaceholder('租户名称')).toHaveValue('TenantA');
+  // Slice57:用户/策略区(platform_admin 经 path-tid RLS 读目标租户);TenantA 有用户 ua@a.com
+  await expect(page.getByText('用户', { exact: true })).toBeVisible();
+  await expect(page.getByText('ua@a.com')).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText('策略', { exact: true })).toBeVisible();
+  await expect(page.getByText('读取用户失败')).toHaveCount(0); // users 读成功
+  await expect(page.getByText('读取策略失败')).toHaveCount(0); // policies 读成功(platform_admin RLS)
   await page.waitForTimeout(400); // 待 Drawer 滑入动画定格,截图更清晰
   await page.screenshot({ path: 'e2e/shot-04-tenant-drawer.png' });
   await page.keyboard.press('Escape');

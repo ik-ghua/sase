@@ -51,6 +51,20 @@ describe('Tenants 页', () => {
     mockGET.mockReset();
     mockPATCH.mockReset();
     mockPOST.mockReset();
+    // Slice57:Drawer 打开会触发 users/bundle GET;默认兜底返空 ok(各测试的 mockResolvedValueOnce
+    // 仍优先用于首个 GET=fetchTenants)。tenants 路径默认空(测试用 once 覆盖)。
+    mockGET.mockImplementation((path: string) => {
+      if (path === '/api/v1/tenants/{tid}/users') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/policies/bundle') {
+        return Promise.resolve({ data: null, response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/policies') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
+      return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+    });
   });
 
   it('成功路径:渲染租户行', async () => {
@@ -196,5 +210,51 @@ describe('Tenants 页', () => {
       expect(screen.getByText('该租户已注销(终态),不可操作。')).toBeInTheDocument(),
     );
     expect(screen.queryByText('编辑租户')).not.toBeInTheDocument();
+  });
+
+  it('Drawer 显示用户列表 + 激活策略版本 + 策略列表(Slice57/58)', async () => {
+    mockGET.mockImplementation((path: string) => {
+      if (path === '/api/v1/tenants/{tid}/users') {
+        return Promise.resolve({
+          data: [{ id: 'u1', external_id: 'ext-1', email: 'alice@t.io', status: 'active' }],
+          response: { ok: true, status: 200 },
+        });
+      }
+      if (path === '/api/v1/tenants/{tid}/policies/bundle') {
+        return Promise.resolve({
+          data: { version: 7, content_hash: 'abcdef0123456789', changed: false },
+          response: { ok: true, status: 200 },
+        });
+      }
+      if (path === '/api/v1/tenants/{tid}/policies') {
+        return Promise.resolve({
+          data: [
+            {
+              id: 'p1',
+              name: 'deny-risk',
+              priority: 10,
+              subject_kind: 'risk_gte',
+              subject_value: 'critical',
+              resource: 'app-x',
+              action: 'access',
+              effect: 'deny',
+            },
+          ],
+          response: { ok: true, status: 200 },
+        });
+      }
+      return Promise.resolve({ data: [activeTenant], response: { ok: true, status: 200 } });
+    });
+    renderWith();
+    await waitFor(() => expect(screen.getByText('TenantA')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /详情/ }));
+    // 用户区:渲染用户行
+    await waitFor(() => expect(screen.getByText('alice@t.io')).toBeInTheDocument());
+    expect(screen.getByText('ext-1')).toBeInTheDocument();
+    // 策略区:激活版本(在 Paragraph 中,用正则子串匹配)
+    expect(screen.getByText(/激活版本 v7/)).toBeInTheDocument();
+    // 策略列表:渲染策略行(主体 risk_gte:critical + 效果 deny)
+    expect(screen.getByText('risk_gte:critical')).toBeInTheDocument();
+    expect(screen.getByText('app-x')).toBeInTheDocument();
   });
 });
