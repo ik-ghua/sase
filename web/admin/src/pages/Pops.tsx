@@ -1,6 +1,6 @@
 // Slice 45:PoP 注册页(首个含写操作的页 → 端到端验证 Slice40 CSRF + Slice42 Bearer 在 POST/PATCH 真联通)。
 // 列表 GET /platform/pop-nodes;新建 POST;编辑 PATCH(仅 status/max_users,name/region/endpoint 不可改防 ID 漂移)。
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import {
   Card,
   Table,
@@ -14,6 +14,9 @@ import {
   Input,
   InputNumber,
   Select,
+  Row,
+  Col,
+  Statistic,
   App as AntdApp,
 } from 'antd';
 import { ReloadOutlined, PlusOutlined, EditOutlined } from '@ant-design/icons';
@@ -123,6 +126,25 @@ export default function Pops() {
     setEditTarget(p);
   };
 
+  // Slice66:按地域容量概览(节点数 + active/draining/down 分布 + 容量配额合计)。
+  const regionSummary = useMemo(() => {
+    const agg: Record<
+      string,
+      { total: number; active: number; draining: number; down: number; capacity: number; unlimited: number }
+    > = {};
+    for (const p of query.data ?? []) {
+      const region = p.region || '(未知)';
+      const g = (agg[region] ??= { total: 0, active: 0, draining: 0, down: 0, capacity: 0, unlimited: 0 });
+      g.total += 1;
+      if (p.status === 'active') g.active += 1;
+      else if (p.status === 'draining') g.draining += 1;
+      else if (p.status === 'down') g.down += 1;
+      if (typeof p.max_users === 'number') g.capacity += p.max_users;
+      else g.unlimited += 1;
+    }
+    return Object.entries(agg).sort((a, b) => a[0].localeCompare(b[0]));
+  }, [query.data]);
+
   const columns: ColumnsType<PoP> = [
     {
       title: 'ID',
@@ -186,6 +208,28 @@ export default function Pops() {
       </div>
 
       {query.isError && <AppError error={query.error} onRetry={() => query.refetch()} />}
+
+      {/* Slice66:按地域容量概览 */}
+      {regionSummary.length > 0 && (
+        <Row gutter={[12, 12]} style={{ marginBottom: 16 }}>
+          {regionSummary.map(([region, g]) => (
+            <Col key={region} xs={24} sm={12} md={8} lg={6}>
+              <Card size="small" title={`地域 ${region}`}>
+                <Statistic title="节点数" value={g.total} />
+                <Space size={[4, 4]} wrap style={{ marginTop: 8 }}>
+                  <Tag color="success">active {g.active}</Tag>
+                  <Tag color="warning">draining {g.draining}</Tag>
+                  <Tag color="error">down {g.down}</Tag>
+                </Space>
+                <div style={{ marginTop: 8, color: 'rgba(0,0,0,0.45)' }}>
+                  容量配额 {g.capacity.toLocaleString('zh-CN')}
+                  {g.unlimited > 0 ? `(${g.unlimited} 个不限)` : ''}
+                </div>
+              </Card>
+            </Col>
+          ))}
+        </Row>
+      )}
 
       <Table
         rowKey="id"

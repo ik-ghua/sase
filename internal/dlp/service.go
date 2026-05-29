@@ -14,6 +14,9 @@ import (
 // ErrNotFound 表示规则不存在(或在当前租户 RLS 上下文下不可见)。
 var ErrNotFound = errors.New("dlp: 规则不存在")
 
+// ErrInvalidRule 表示规则字段校验失败(handler 据此返 400,区别于 DB/内部错的 500)。
+var ErrInvalidRule = errors.New("dlp: 规则字段非法")
+
 // Service 是 DLP 规则的编写/读取(租户作用域,经 data 层 RLS)。变更发 NOTIFY → xds-server 下发 PoP。
 type Service interface {
 	CreateRule(ctx context.Context, tenantID string, r *Rule) error
@@ -36,23 +39,23 @@ func validSeverity(s string) bool {
 // normalizeAndValidate 校验并补默认(Create/Update 共用);正则规则入库前校验可编译(fail-loud,免运行期静默不命中)。
 func normalizeAndValidate(r *Rule) error {
 	if r.Name == "" || r.Pattern == "" {
-		return errors.New("dlp: name 与 pattern 必填")
+		return fmt.Errorf("name 与 pattern 必填: %w", ErrInvalidRule)
 	}
 	if r.MatchType != MatchKeyword && r.MatchType != MatchRegex {
-		return errors.New("dlp: match_type 须为 keyword|regex")
+		return fmt.Errorf("match_type 须为 keyword|regex: %w", ErrInvalidRule)
 	}
 	if r.Action != ActionBlock && r.Action != ActionAlert {
-		return errors.New("dlp: action 须为 block|alert")
+		return fmt.Errorf("action 须为 block|alert: %w", ErrInvalidRule)
 	}
 	if r.Severity == "" {
 		r.Severity = SeverityMedium
 	}
 	if !validSeverity(r.Severity) {
-		return errors.New("dlp: severity 须为 low|medium|high")
+		return fmt.Errorf("severity 须为 low|medium|high: %w", ErrInvalidRule)
 	}
 	if r.MatchType == MatchRegex {
 		if _, err := regexp.Compile(r.Pattern); err != nil {
-			return fmt.Errorf("dlp: 正则非法: %w", err)
+			return fmt.Errorf("正则非法(%v): %w", err, ErrInvalidRule)
 		}
 	}
 	return nil

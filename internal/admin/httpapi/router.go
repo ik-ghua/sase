@@ -758,6 +758,22 @@ func revokeCredential(svc identity.Service) http.HandlerFunc {
 	}
 }
 
+// writeRuleError 把规则 CRUD 错误分流为 HTTP 状态(Slice66 错误码治理):
+//   - 不存在(含跨租户 RLS 不可见)→ 404(通用文案);
+//   - 校验失败(ErrInvalidRule)→ 400(校验信息对调用方有用且安全,可回显);
+//   - 其它(DB/内部)→ 500(脱敏:记日志保留细节,响应只给通用文案,不泄漏内部错误)。
+func writeRuleError(w http.ResponseWriter, op string, err error, notFound, invalid error) {
+	switch {
+	case errors.Is(err, notFound):
+		http.Error(w, "规则不存在", http.StatusNotFound)
+	case errors.Is(err, invalid):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	default:
+		log.Printf("[admin] %s 内部错误: %v", op, err)
+		http.Error(w, "服务端错误", http.StatusInternalServerError)
+	}
+}
+
 func createSWGRule(svc swg.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var rule swg.Rule
@@ -765,7 +781,7 @@ func createSWGRule(svc swg.Service) http.HandlerFunc {
 			return
 		}
 		if err := svc.CreateRule(r.Context(), r.PathValue("tid"), &rule); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRuleError(w, "create swg rule", err, swg.ErrNotFound, swg.ErrInvalidRule)
 			return
 		}
 		writeJSON(w, http.StatusCreated, rule)
@@ -776,7 +792,8 @@ func listSWGRules(svc swg.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rs, err := svc.ListRules(r.Context(), r.PathValue("tid"))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("[admin] list swg rules 内部错误: %v", err)
+			http.Error(w, "服务端错误", http.StatusInternalServerError)
 			return
 		}
 		writeJSON(w, http.StatusOK, rs)
@@ -790,7 +807,7 @@ func createFWRule(svc fw.Service) http.HandlerFunc {
 			return
 		}
 		if err := svc.CreateRule(r.Context(), r.PathValue("tid"), &rule); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRuleError(w, "create fw rule", err, fw.ErrNotFound, fw.ErrInvalidRule)
 			return
 		}
 		writeJSON(w, http.StatusCreated, rule)
@@ -801,7 +818,8 @@ func listFWRules(svc fw.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rs, err := svc.ListRules(r.Context(), r.PathValue("tid"))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("[admin] list fw rules 内部错误: %v", err)
+			http.Error(w, "服务端错误", http.StatusInternalServerError)
 			return
 		}
 		writeJSON(w, http.StatusOK, rs)
@@ -815,7 +833,7 @@ func createDLPRule(svc dlp.Service) http.HandlerFunc {
 			return
 		}
 		if err := svc.CreateRule(r.Context(), r.PathValue("tid"), &rule); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeRuleError(w, "create dlp rule", err, dlp.ErrNotFound, dlp.ErrInvalidRule)
 			return
 		}
 		writeJSON(w, http.StatusCreated, rule)
@@ -826,7 +844,8 @@ func listDLPRules(svc dlp.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rs, err := svc.ListRules(r.Context(), r.PathValue("tid"))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("[admin] list dlp rules 内部错误: %v", err)
+			http.Error(w, "服务端错误", http.StatusInternalServerError)
 			return
 		}
 		writeJSON(w, http.StatusOK, rs)
@@ -834,7 +853,7 @@ func listDLPRules(svc dlp.Service) http.HandlerFunc {
 }
 
 // ── 安全规则 PUT(全量替换)/ DELETE(三项能力对称;PUT 复用 Create 校验,DELETE 幂等)──
-// 不存在的 id(含跨租户 RLS 不可见)→ 404;校验失败 → 400;成功 PUT → 200+规则、DELETE → 204。
+// 错误码分流见 writeRuleError(404/400/500);成功 PUT → 200+规则、DELETE → 204。
 
 func updateSWGRule(svc swg.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -842,29 +861,21 @@ func updateSWGRule(svc swg.Service) http.HandlerFunc {
 		if !decode(w, r, &rule) {
 			return
 		}
-		err := svc.UpdateRule(r.Context(), r.PathValue("tid"), r.PathValue("id"), &rule)
-		switch {
-		case errors.Is(err, swg.ErrNotFound):
-			http.Error(w, err.Error(), http.StatusNotFound)
-		case err != nil:
-			http.Error(w, err.Error(), http.StatusBadRequest)
-		default:
-			writeJSON(w, http.StatusOK, rule)
+		if err := svc.UpdateRule(r.Context(), r.PathValue("tid"), r.PathValue("id"), &rule); err != nil {
+			writeRuleError(w, "update swg rule", err, swg.ErrNotFound, swg.ErrInvalidRule)
+			return
 		}
+		writeJSON(w, http.StatusOK, rule)
 	}
 }
 
 func deleteSWGRule(svc swg.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		err := svc.DeleteRule(r.Context(), r.PathValue("tid"), r.PathValue("id"))
-		switch {
-		case errors.Is(err, swg.ErrNotFound):
-			http.Error(w, err.Error(), http.StatusNotFound)
-		case err != nil:
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		default:
-			w.WriteHeader(http.StatusNoContent)
+		if err := svc.DeleteRule(r.Context(), r.PathValue("tid"), r.PathValue("id")); err != nil {
+			writeRuleError(w, "delete swg rule", err, swg.ErrNotFound, swg.ErrInvalidRule)
+			return
 		}
+		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
@@ -874,29 +885,21 @@ func updateFWRule(svc fw.Service) http.HandlerFunc {
 		if !decode(w, r, &rule) {
 			return
 		}
-		err := svc.UpdateRule(r.Context(), r.PathValue("tid"), r.PathValue("id"), &rule)
-		switch {
-		case errors.Is(err, fw.ErrNotFound):
-			http.Error(w, err.Error(), http.StatusNotFound)
-		case err != nil:
-			http.Error(w, err.Error(), http.StatusBadRequest)
-		default:
-			writeJSON(w, http.StatusOK, rule)
+		if err := svc.UpdateRule(r.Context(), r.PathValue("tid"), r.PathValue("id"), &rule); err != nil {
+			writeRuleError(w, "update fw rule", err, fw.ErrNotFound, fw.ErrInvalidRule)
+			return
 		}
+		writeJSON(w, http.StatusOK, rule)
 	}
 }
 
 func deleteFWRule(svc fw.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		err := svc.DeleteRule(r.Context(), r.PathValue("tid"), r.PathValue("id"))
-		switch {
-		case errors.Is(err, fw.ErrNotFound):
-			http.Error(w, err.Error(), http.StatusNotFound)
-		case err != nil:
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		default:
-			w.WriteHeader(http.StatusNoContent)
+		if err := svc.DeleteRule(r.Context(), r.PathValue("tid"), r.PathValue("id")); err != nil {
+			writeRuleError(w, "delete fw rule", err, fw.ErrNotFound, fw.ErrInvalidRule)
+			return
 		}
+		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
@@ -906,29 +909,21 @@ func updateDLPRule(svc dlp.Service) http.HandlerFunc {
 		if !decode(w, r, &rule) {
 			return
 		}
-		err := svc.UpdateRule(r.Context(), r.PathValue("tid"), r.PathValue("id"), &rule)
-		switch {
-		case errors.Is(err, dlp.ErrNotFound):
-			http.Error(w, err.Error(), http.StatusNotFound)
-		case err != nil:
-			http.Error(w, err.Error(), http.StatusBadRequest)
-		default:
-			writeJSON(w, http.StatusOK, rule)
+		if err := svc.UpdateRule(r.Context(), r.PathValue("tid"), r.PathValue("id"), &rule); err != nil {
+			writeRuleError(w, "update dlp rule", err, dlp.ErrNotFound, dlp.ErrInvalidRule)
+			return
 		}
+		writeJSON(w, http.StatusOK, rule)
 	}
 }
 
 func deleteDLPRule(svc dlp.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		err := svc.DeleteRule(r.Context(), r.PathValue("tid"), r.PathValue("id"))
-		switch {
-		case errors.Is(err, dlp.ErrNotFound):
-			http.Error(w, err.Error(), http.StatusNotFound)
-		case err != nil:
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		default:
-			w.WriteHeader(http.StatusNoContent)
+		if err := svc.DeleteRule(r.Context(), r.PathValue("tid"), r.PathValue("id")); err != nil {
+			writeRuleError(w, "delete dlp rule", err, dlp.ErrNotFound, dlp.ErrInvalidRule)
+			return
 		}
+		w.WriteHeader(http.StatusNoContent)
 	}
 }
 

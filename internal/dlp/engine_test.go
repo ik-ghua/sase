@@ -44,3 +44,45 @@ func TestEvaluate(t *testing.T) {
 		t.Fatalf("非法正则应不命中(fail-open),得 %+v", r)
 	}
 }
+
+// Slice66:预编译路径——非法正则编译后永不命中(fail-open,与原 ruleMatch 一致);合法正则命中。
+func TestCompiledRegex(t *testing.T) {
+	e := NewRuleEngine()
+	bad := Compile([]Rule{{Name: "x", MatchType: MatchRegex, Pattern: "[", Action: ActionAlert, Severity: SeverityLow}})
+	if r := e.EvaluateCompiled(bad, "anything ["); len(r.Findings) != 0 {
+		t.Fatalf("非法正则不应命中(fail-open),得 %+v", r.Findings)
+	}
+	good := Compile([]Rule{{Name: "ssn", MatchType: MatchRegex, Pattern: `\d{3}-\d{4}`, Action: ActionBlock, Severity: SeverityHigh}})
+	r := e.EvaluateCompiled(good, "call 123-4567 now")
+	if !r.Block || len(r.Findings) != 1 {
+		t.Fatalf("合法正则应命中 block,得 %+v", r)
+	}
+}
+
+func benchDLPRules() []Rule {
+	return []Rule{
+		{Name: "kw", MatchType: MatchKeyword, Pattern: "绝密", Action: ActionAlert, Severity: SeverityMedium},
+		{Name: "ssn", MatchType: MatchRegex, Pattern: `\d{3}-\d{2}-\d{4}`, Action: ActionBlock, Severity: SeverityHigh},
+		{Name: "id", MatchType: MatchRegex, Pattern: `[1-9]\d{16}[\dXx]`, Action: ActionBlock, Severity: SeverityHigh},
+	}
+}
+
+// BenchmarkEvaluateRaw:每次扫描都 Compile(等价旧的每次 regexp.Compile)。
+func BenchmarkEvaluateRaw(b *testing.B) {
+	e, rules := NewRuleEngine(), benchDLPRules()
+	const content = "normal business content with phone 555-1234 and some text"
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = e.Evaluate(rules, content)
+	}
+}
+
+// BenchmarkEvaluateCompiled:预编译一次,热路径零 regexp.Compile(Slice66 收益)。
+func BenchmarkEvaluateCompiled(b *testing.B) {
+	e, cs := NewRuleEngine(), Compile(benchDLPRules())
+	const content = "normal business content with phone 555-1234 and some text"
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = e.EvaluateCompiled(cs, content)
+	}
+}

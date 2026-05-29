@@ -127,4 +127,23 @@ describe('Pops 页', () => {
       body: { status: 'active', max_users: 1000 },
     });
   });
+
+  it('按地域容量概览:聚合节点数/状态/容量(Slice66)', async () => {
+    mockGET.mockResolvedValueOnce({
+      data: [
+        { ...samplePop, id: 'p1', region: 'cn-east-1', status: 'active', max_users: 1000 },
+        { ...samplePop, id: 'p2', region: 'cn-east-1', status: 'down', max_users: 500 },
+        { ...samplePop, id: 'p3', region: 'cn-north-1', status: 'active', max_users: null },
+      ],
+      response: { ok: true, status: 200 },
+    });
+    renderWith();
+    await waitFor(() => expect(screen.getByText('地域 cn-east-1')).toBeInTheDocument());
+    expect(screen.getByText('地域 cn-north-1')).toBeInTheDocument();
+    // cn-east-1: 容量 1000+500=1,500(无不限)
+    expect(screen.getByText(/容量配额\s*1,500/)).toBeInTheDocument();
+    // cn-north-1: 容量 0 + 1 个不限
+    expect(screen.getByText(/1 个不限/)).toBeInTheDocument();
+  });
+
 });

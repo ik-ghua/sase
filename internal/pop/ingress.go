@@ -140,7 +140,7 @@ func (ig *Ingress) access(w http.ResponseWriter, r *http.Request) {
 	// 内容源 stand-in:当前数据路径无 body,扫描可见的 URL path(生产经 Envoy ext_proc 取 body)。
 	// fail-open 同 SWG:DLP 缺失/引擎缺陷不扩大访问、也不误阻断(该拒的已在 ② 拦下)。
 	if effect == xdsv1.EffectInspect && ig.dlpEngine != nil && ig.dlpStore != nil {
-		res := ig.dlpEngine.Evaluate(ig.dlpStore.Get(claims.TenantID), path)
+		res := ig.dlpEngine.EvaluateCompiled(ig.dlpStore.Get(claims.TenantID), path)
 		for _, f := range res.Findings {
 			if ig.dlpSink != nil {
 				ig.dlpSink.Report(claims.TenantID, claims.Subject, claims.JTI, f) // DLP 命中 → 风险引擎(带会话 jti)

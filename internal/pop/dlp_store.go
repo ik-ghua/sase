@@ -8,22 +8,24 @@ import (
 )
 
 // DLPStore 持各租户当前 DLP 规则(由 DLP xDS 流回调整体替换,inspect 流量检测时查)。
+// 持**预编译**规则集(Set 时编译 regex,inspect 热路径零 regexp.Compile)。
 type DLPStore struct {
 	mu sync.RWMutex
-	m  map[string][]dlp.Rule
+	m  map[string]dlp.CompiledRuleSet
 }
 
-func NewDLPStore() *DLPStore { return &DLPStore{m: map[string][]dlp.Rule{}} }
+func NewDLPStore() *DLPStore { return &DLPStore{m: map[string]dlp.CompiledRuleSet{}} }
 
-// Set 整体替换某租户的 DLP 规则集。
+// Set 整体替换某租户的 DLP 规则集(预编译 regex,每租户替换时一次、非热路径)。
 func (s *DLPStore) Set(tenantID string, rules []dlp.Rule) {
+	cs := dlp.Compile(rules)
 	s.mu.Lock()
-	s.m[tenantID] = rules
+	s.m[tenantID] = cs
 	s.mu.Unlock()
 }
 
-// Get 返回某租户 DLP 规则(无则 nil,引擎按无命中处理)。
-func (s *DLPStore) Get(tenantID string) []dlp.Rule {
+// Get 返回某租户预编译 DLP 规则集(无则零值 CompiledRuleSet,引擎按无命中处理)。
+func (s *DLPStore) Get(tenantID string) dlp.CompiledRuleSet {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.m[tenantID]

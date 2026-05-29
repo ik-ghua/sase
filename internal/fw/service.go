@@ -14,6 +14,9 @@ import (
 // ErrNotFound 表示规则不存在(或在当前租户 RLS 上下文下不可见)。
 var ErrNotFound = errors.New("fw: 规则不存在")
 
+// ErrInvalidRule 表示规则字段校验失败(handler 据此返 400,区别于 DB/内部错的 500)。
+var ErrInvalidRule = errors.New("fw: 规则字段非法")
+
 // Service 是 FWaaS 规则的编写/读取(租户作用域,经 data 层 RLS)。变更发 NOTIFY → xds-server 下发 PoP。
 type Service interface {
 	CreateRule(ctx context.Context, tenantID string, r *Rule) error
@@ -42,10 +45,10 @@ func validProto(p string) bool {
 // 非法配置不入库免运行期误判)。
 func normalizeAndValidate(r *Rule) error {
 	if r.Action != ActionAllow && r.Action != ActionDeny {
-		return errors.New("fw: action 须为 allow|deny")
+		return fmt.Errorf("action 须为 allow|deny: %w", ErrInvalidRule)
 	}
 	if !validProto(r.Protocol) {
-		return errors.New("fw: protocol 须为 any|tcp|udp|icmp")
+		return fmt.Errorf("protocol 须为 any|tcp|udp|icmp: %w", ErrInvalidRule)
 	}
 	if r.Protocol == "" {
 		r.Protocol = ProtoAny
@@ -53,14 +56,14 @@ func normalizeAndValidate(r *Rule) error {
 	for _, c := range []string{r.SrcCIDR, r.DstCIDR} {
 		if c != "" {
 			if _, _, err := net.ParseCIDR(c); err != nil {
-				return fmt.Errorf("fw: cidr %q 非法: %w", c, err)
+				return fmt.Errorf("cidr %q 非法(%v): %w", c, err, ErrInvalidRule)
 			}
 		}
 	}
 	// 端口范围:0,0=any;否则须 0<min<=max(防 [min,0] 这类静默吞没规则的配置)
 	if r.DstPortMin != 0 || r.DstPortMax != 0 {
 		if r.DstPortMin == 0 || r.DstPortMax == 0 || r.DstPortMin > r.DstPortMax {
-			return errors.New("fw: 端口范围须 0<min<=max(或两者皆 0 表 any)")
+			return fmt.Errorf("端口范围须 0<min<=max(或两者皆 0 表 any): %w", ErrInvalidRule)
 		}
 	}
 	return nil

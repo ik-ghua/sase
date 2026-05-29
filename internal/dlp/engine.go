@@ -49,8 +49,11 @@ type Result struct {
 }
 
 // Engine 是 DLP 检测引擎(接口隔离:关键词/正则起步,后续可换指纹/ML/采购)。
+//   - Evaluate:对原始规则检测(每次内部 Compile,便于测试/低频路径)。
+//   - EvaluateCompiled:对**预编译**规则集检测(热路径:regex 已 Compile,免每次扫描重编译)。
 type Engine interface {
 	Evaluate(rules []Rule, content string) Result
+	EvaluateCompiled(cs CompiledRuleSet, content string) Result
 }
 
 // NewRuleEngine 返回规则引擎:扫描内容,命中即记 Finding;命中 block 规则置 Block。
@@ -58,34 +61,69 @@ func NewRuleEngine() Engine { return ruleEngine{} }
 
 type ruleEngine struct{}
 
-func (ruleEngine) Evaluate(rules []Rule, content string) Result {
-	var res Result
+// compiledRule 是预编译规则:regex 已 Compile 一次(非法正则 → re=nil,永不命中,保留 fail-open)。
+type compiledRule struct {
+	name      string
+	severity  string
+	action    string
+	matchType string
+	keyword   string         // MatchKeyword:子串
+	re        *regexp.Regexp // MatchRegex:已编译(nil=非法,永不命中)
+}
+
+// CompiledRuleSet 是预编译规则集(下发侧 Set 时编译一次,热路径零 regexp.Compile)。
+type CompiledRuleSet struct {
+	rules []compiledRule
+}
+
+// Len 返回规则条数(测试/自检用;零值 CompiledRuleSet 为 0)。
+func (cs CompiledRuleSet) Len() int { return len(cs.rules) }
+
+// Compile 把规则集预编译:regex 规则 Compile 一次(非法正则保留 fail-open:re=nil 永不命中)。
+func Compile(rules []Rule) CompiledRuleSet {
+	out := make([]compiledRule, 0, len(rules))
 	for i := range rules {
 		r := &rules[i]
-		if !ruleMatch(r, content) {
+		cr := compiledRule{name: r.Name, severity: r.Severity, action: r.Action, matchType: r.MatchType}
+		switch r.MatchType {
+		case MatchKeyword:
+			cr.keyword = r.Pattern
+		case MatchRegex:
+			if re, err := regexp.Compile(r.Pattern); err == nil {
+				cr.re = re
+			} // 非法正则:re 留 nil → 永不命中(fail-open,与原 ruleMatch 一致)
+		}
+		out = append(out, cr)
+	}
+	return CompiledRuleSet{rules: out}
+}
+
+func (ruleEngine) Evaluate(rules []Rule, content string) Result {
+	return ruleEngine{}.EvaluateCompiled(Compile(rules), content)
+}
+
+func (ruleEngine) EvaluateCompiled(cs CompiledRuleSet, content string) Result {
+	var res Result
+	for i := range cs.rules {
+		cr := &cs.rules[i]
+		if !matchesCompiled(cr, content) {
 			continue
 		}
-		res.Findings = append(res.Findings, Finding{RuleName: r.Name, Severity: r.Severity, Action: r.Action})
-		if r.Action == ActionBlock {
+		res.Findings = append(res.Findings, Finding{RuleName: cr.name, Severity: cr.severity, Action: cr.action})
+		if cr.action == ActionBlock {
 			res.Block = true
 		}
 	}
 	return res
 }
 
-// ruleMatch:keyword 子串匹配;regex 正则匹配。非法正则视为不命中(fail-open:DLP 缺陷不应误拦正常流量;
-// 与 PEP/防火墙的 fail-closed 不同——DLP 是 inspect 之上的附加检测,引擎缺陷不扩大访问也不误阻断)。
-// 骨架性能限:每次扫描对每条 regex 规则重 Compile;生产应预编译缓存进 Rule。
-func ruleMatch(r *Rule, content string) bool {
-	switch r.MatchType {
+// matchesCompiled:keyword 子串匹配;regex 用预编译 re(nil → 不命中,fail-open)。
+func matchesCompiled(cr *compiledRule, content string) bool {
+	switch cr.matchType {
 	case MatchKeyword:
-		return r.Pattern != "" && strings.Contains(content, r.Pattern)
+		return cr.keyword != "" && strings.Contains(content, cr.keyword)
 	case MatchRegex:
-		re, err := regexp.Compile(r.Pattern)
-		if err != nil {
-			return false
-		}
-		return re.MatchString(content)
+		return cr.re != nil && cr.re.MatchString(content)
 	default:
 		return false
 	}

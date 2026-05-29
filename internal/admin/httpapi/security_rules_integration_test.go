@@ -104,6 +104,11 @@ func TestSecurityRuleLifecycleHTTP(t *testing.T) {
 	// PUT 不存在 id → 404
 	do(t, srv.URL, taTok, "PUT", base+"/"+uuid.NewString(), map[string]string{"kind": "host", "pattern": "x.com", "action": "block"}, http.StatusNotFound)
 
+	// Slice66 错误码治理:PUT 校验失败(非法 kind)→ 400(非 500;ErrInvalidRule 分流)
+	do(t, srv.URL, taTok, "PUT", base+"/"+id, map[string]string{"kind": "bogus", "pattern": "x", "action": "block"}, http.StatusBadRequest)
+	// POST 校验失败(缺 pattern)→ 400
+	do(t, srv.URL, taTok, "POST", base, map[string]string{"kind": "host", "action": "block"}, http.StatusBadRequest)
+
 	// authz:auditor(只读)PUT/DELETE → 403(子路径写被 authz line161 拒)
 	do(t, srv.URL, audTok, "PUT", base+"/"+id, map[string]string{"kind": "host", "pattern": "y.com", "action": "block"}, http.StatusForbidden)
 	do(t, srv.URL, audTok, "DELETE", base+"/"+id, nil, http.StatusForbidden)

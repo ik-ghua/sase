@@ -58,3 +58,42 @@ func TestEvaluate(t *testing.T) {
 		t.Fatal("非法 CIDR 规则不应匹配放行(fail-closed)")
 	}
 }
+
+// Slice66:预编译路径正确性——非法 CIDR 编译后永不匹配(保留 fail-closed),合法 CIDR 仍匹配。
+func TestCompiledInvalidCIDR(t *testing.T) {
+	e := NewRuleEngine()
+	bad := Compile([]Rule{{Priority: 1, Action: ActionAllow, Protocol: ProtoTCP, DstCIDR: "not-a-cidr", DstPortMin: 80, DstPortMax: 80}})
+	if e.EvaluateCompiled(bad, tcp("10.0.0.1", "10.0.0.2", 80)).Allow {
+		t.Fatal("非法 CIDR 规则不应匹配放行(fail-closed → default-deny)")
+	}
+	good := Compile([]Rule{{Priority: 1, Action: ActionAllow, Protocol: ProtoTCP, DstCIDR: "10.0.0.0/24", DstPortMin: 80, DstPortMax: 80}})
+	if !e.EvaluateCompiled(good, tcp("10.0.0.1", "10.0.0.2", 80)).Allow {
+		t.Fatal("合法 CIDR 应匹配放行")
+	}
+}
+
+func benchRules() []Rule {
+	return []Rule{
+		{Priority: 1, Action: ActionDeny, Protocol: ProtoTCP, DstCIDR: "10.9.0.9/32", DstPortMin: 22, DstPortMax: 22},
+		{Priority: 2, Action: ActionAllow, Protocol: ProtoTCP, SrcCIDR: "10.0.0.0/8", DstCIDR: "10.9.0.0/16", DstPortMin: 443, DstPortMax: 443},
+		{Priority: 3, Action: ActionAllow, Protocol: ProtoAny, DstCIDR: "192.168.0.0/16"},
+	}
+}
+
+// BenchmarkEvaluateRaw:每次裁决都 Compile(等价旧的每包 net.ParseCIDR)。
+func BenchmarkEvaluateRaw(b *testing.B) {
+	e, rules, p := NewRuleEngine(), benchRules(), tcp("10.0.0.1", "10.9.0.5", 443)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = e.Evaluate(rules, p)
+	}
+}
+
+// BenchmarkEvaluateCompiled:预编译一次,热路径零 CIDR 解析(Slice66 收益)。
+func BenchmarkEvaluateCompiled(b *testing.B) {
+	e, cs, p := NewRuleEngine(), Compile(benchRules()), tcp("10.0.0.1", "10.9.0.5", 443)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = e.EvaluateCompiled(cs, p)
+	}
+}

@@ -149,7 +149,7 @@ func TestZTNADataPathEndToEnd(t *testing.T) {
 		return ok
 	})
 	waitUntil(t, 5*time.Second, "PoP 装载 SWG 规则", func() bool { return len(swgStore.Get(tid)) > 0 })
-	waitUntil(t, 5*time.Second, "PoP 装载 DLP 规则", func() bool { return len(dlpStore.Get(tid)) > 0 })
+	waitUntil(t, 5*time.Second, "PoP 装载 DLP 规则", func() bool { return dlpStore.Get(tid).Len() > 0 })
 
 	// Connector 反向通道(mTLS)+ echo 应用(仅 app1 有连接器)
 	reg := revtunnel.NewRegistry()

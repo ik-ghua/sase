@@ -13,6 +13,9 @@ import (
 // ErrNotFound 表示规则不存在(或在当前租户 RLS 上下文下不可见)。
 var ErrNotFound = errors.New("swg: 规则不存在")
 
+// ErrInvalidRule 表示规则字段校验失败(handler 据此返 400,区别于 DB/内部错的 500)。
+var ErrInvalidRule = errors.New("swg: 规则字段非法")
+
 // Service 是 SWG 规则的编写/读取(租户作用域,经 data 层 RLS)。变更发 NOTIFY → xds-server 下发 PoP。
 type Service interface {
 	CreateRule(ctx context.Context, tenantID string, r *Rule) error
@@ -31,10 +34,10 @@ func NewService(store data.Store) Service { return &service{store: store} }
 // normalizeAndValidate 校验并补默认(Create/Update 共用,保证改规则与建规则同等约束)。
 func normalizeAndValidate(r *Rule) error {
 	if r.Kind != KindHost && r.Kind != KindPathPrefix {
-		return errors.New("swg: kind 须为 host|path_prefix")
+		return fmt.Errorf("kind 须为 host|path_prefix: %w", ErrInvalidRule)
 	}
 	if r.Pattern == "" {
-		return errors.New("swg: pattern 必填")
+		return fmt.Errorf("pattern 必填: %w", ErrInvalidRule)
 	}
 	if r.Action == "" {
 		r.Action = ActionBlock
