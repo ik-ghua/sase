@@ -1,0 +1,16 @@
+node_modules
+dist
+dist-ssr
+*.local
+.DS_Store
+.idea
+.vscode
+*.log
+coverage
+*.tsbuildinfo
+
+# Playwright e2e 产物(截图/报告/缓存)
+/test-results/
+/playwright-report/
+/blob-report/
+e2e/shot-*.png
