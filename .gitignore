@@ -9,6 +9,15 @@
 *.out
 *.test
 .DS_Store
+# cmd 二进制(`go build ./cmd/xxx` 会在仓库根留同名二进制;构建产物归 /output,绝不入库)
+/api-server
+/xds-server
+/pop-agent
+/cpe
+/connector
+/agent
+/devpki
+/echo
 
 # 杂项工具缓存
 .cache/
