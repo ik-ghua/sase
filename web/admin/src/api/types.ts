@@ -615,6 +615,59 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tenants/{tid}/risk": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 租户 ID(UUID) */
+                tid: components["parameters"]["Tid"];
+            };
+            cookie?: never;
+        };
+        /**
+         * 列本租户全部风险评分快照(只读;score 降序、subject 升序;platform_admin 经 path-tid RLS 可读任意租户)
+         * @description 风险引擎持久化快照层(评分变更后 best-effort upsert)。**权威评分态在内存**,本端点暴露全部最新落库快照。
+         *     快照持久化未启用 → 503;空租户 → 空数组 []。
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description 租户 ID(UUID) */
+                    tid: components["parameters"]["Tid"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["RiskScore"][];
+                    };
+                };
+                /** @description risk 服务未配置或快照持久化未启用 */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tenants/{tid}/risk/{subject}": {
         parameters: {
             query?: never;

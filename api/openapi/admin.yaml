@@ -147,6 +147,18 @@ paths:
       summary: 读本租户审计日志(只读;auditor 可读)
       responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AuditEntry' } } } } } }
 
+  /api/v1/tenants/{tid}/risk:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    get:
+      tags: [risk]
+      summary: 列本租户全部风险评分快照(只读;score 降序、subject 升序;platform_admin 经 path-tid RLS 可读任意租户)
+      description: |
+        风险引擎持久化快照层(评分变更后 best-effort upsert)。**权威评分态在内存**,本端点暴露全部最新落库快照。
+        快照持久化未启用 → 503;空租户 → 空数组 []。
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/RiskScore' } } } } }
+        '503': { description: risk 服务未配置或快照持久化未启用 }
+
   /api/v1/tenants/{tid}/risk/{subject}:
     parameters:
       - { $ref: '#/components/parameters/Tid' }

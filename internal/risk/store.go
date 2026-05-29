@@ -121,3 +121,49 @@ func (s *Service) GetScore(ctx context.Context, tenantID, subject string) (*Scor
 
 // ErrNoStore 表示快照层未配置(WithStore 未注入)——GetScore 无法读持久化态(fail-loud)。
 var ErrNoStore = errors.New("risk: 持久化快照层未配置(WithStore 未注入)")
+
+// ListScores 列某租户全部持久化风险快照(经 InTxRO 走 RLS;platform_admin 由调用方传 path-tid 进上下文)。
+// 排序:**score 降序、subject 升序**(高风险优先、同分稳定字典序)。
+// 未启用快照层 → ErrNoStore(fail-loud,同 GetScore);空租户 → 空切片(非 nil,便 JSON 序列化为 [])。
+// 跨租户隔离权威在 RLS:WHERE 不带 tenant_id(由 InTxRO 注入的租户上下文约束),他租户行不可见。
+func (s *Service) ListScores(ctx context.Context, tenantID string) ([]Score, error) {
+	if s.store == nil {
+		return nil, ErrNoStore
+	}
+	if tenantID == "" {
+		return nil, errors.New("risk.ListScores: tenant_id 必填")
+	}
+	out := []Score{} // 非 nil:空租户序列化为 [] 而非 null
+	err := s.store.InTxRO(ctx, tenantID, func(q data.Queries) error {
+		rows, e := q.Query(ctx,
+			`SELECT subject, score, level, factors, updated_at FROM risk_scores
+			 ORDER BY score DESC, subject ASC`) // tenant_id 由 RLS 上下文约束(隔离权威在 RLS)
+		if e != nil {
+			return fmt.Errorf("risk.ListScores query: %w", e)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var (
+				sc        Score
+				level     string
+				factorsdb []byte
+			)
+			if e := rows.Scan(&sc.Subject, &sc.Score, &level, &factorsdb, &sc.UpdatedAt); e != nil {
+				return fmt.Errorf("risk.ListScores scan: %w", e)
+			}
+			sc.Level = Level(level)
+			if len(factorsdb) > 0 {
+				if e := json.Unmarshal(factorsdb, &sc.Factors); e != nil {
+					// 反序列化失败不致命:返回核心快照(score/level),factors 降级为空(配 log 排障)
+					log.Printf("[risk] 快照 factors 反序列化失败(列表)tenant=%s subject=%s: %v", tenantID, sc.Subject, e)
+				}
+			}
+			out = append(out, sc)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}

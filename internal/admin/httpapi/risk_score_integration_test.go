@@ -146,6 +146,171 @@ func TestRiskScoreEndpoint(t *testing.T) {
 	}
 }
 
+// TestRiskScoreListEndpoint:GET /tenants/{tid}/risk(N2,列租户全部快照)端到端。
+// 覆盖:① tenant_admin 列本租户 → 200 + 多条按 score 降序;② 跨租户 → 403;
+//
+//	③ platform_admin 经 path-tid 列任意租户 → 200;④ 空租户 → 200 + [];⑤ riskSvc=nil → 503。
+func TestRiskScoreListEndpoint(t *testing.T) {
+	cfg, ok := data.ConfigFromEnv()
+	if !ok {
+		t.Skip("未设 SASE_DB_RW_DSN,跳过 risk 列表端点端到端测试")
+	}
+	ctx := context.Background()
+	store, err := data.NewPgxStore(ctx, cfg)
+	if err != nil {
+		t.Fatalf("接 DB: %v", err)
+	}
+	defer store.Close()
+
+	signer, err := cred.GenerateSigner()
+	if err != nil {
+		t.Fatalf("签发器: %v", err)
+	}
+	verifier, err := cred.NewVerifier(signer.Public())
+	if err != nil {
+		t.Fatalf("验证器: %v", err)
+	}
+	identitySvc := identity.NewService(store, identity.WithSigner(signer))
+	secSvc := testSecretSvc(t, store)
+	riskSvc := risk.NewService(nil, risk.WithStore(store))
+
+	mux := http.NewServeMux()
+	httpapi.Register(mux,
+		tenant.NewService(store), identitySvc,
+		policy.NewService(store), resource.NewService(store), audit.NewService(store),
+		swg.NewService(store), site.NewService(store), fw.NewService(store), dlp.NewService(store),
+		enroll.NewService(store, nil),
+		platform.NewService(store), nil, nil, nil,
+		testIDPSvc(t, store, secSvc),
+		nil, nil, verifier, nil, nil,
+		riskSvc,
+	)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	tA := uuid.NewString()
+	tB := uuid.NewString()
+	tEmpty := uuid.NewString()
+
+	// 落 tA 三条(不同分数):alice critical(90)、bob medium(50)、carol low(10)。
+	riskSvc.ObservePosture(tA, "alice", "ja", "jailbroken_rooted")
+	riskSvc.Report(tA, "bob", "jb", dlp.Finding{RuleName: "身份证", Severity: dlp.SeverityHigh})
+	riskSvc.Report(tA, "carol", "jc", dlp.Finding{RuleName: "手机号", Severity: dlp.SeverityLow})
+	// 落 tB 一条(验跨租户隔离:tA 列表不应含 tB)。
+	riskSvc.ObservePosture(tB, "b-only", "jbo", "jailbroken_rooted")
+
+	taTok, err := identitySvc.IssueAdminToken(ctx, "ta", authz.RoleTenantAdmin, tA, time.Hour)
+	if err != nil {
+		t.Fatalf("签发 tenant_admin(tA): %v", err)
+	}
+	tbTok, err := identitySvc.IssueAdminToken(ctx, "tb", authz.RoleTenantAdmin, tB, time.Hour)
+	if err != nil {
+		t.Fatalf("签发 tenant_admin(tB): %v", err)
+	}
+	platTok, err := identitySvc.IssueAdminToken(ctx, "plat", authz.RolePlatformAdmin, "", time.Hour)
+	if err != nil {
+		t.Fatalf("签发 platform_admin: %v", err)
+	}
+
+	type scoreRow struct {
+		Subject string `json:"subject"`
+		Score   int    `json:"score"`
+		Level   string `json:"level"`
+	}
+
+	// ① tenant_admin 列 tA → 200 + 3 条按 score 降序 + RLS 隔离(不含 tB 的 b-only)。
+	st, body := doRaw(t, srv.URL, taTok, "GET", "/api/v1/tenants/"+tA+"/risk", nil)
+	if st != http.StatusOK {
+		t.Fatalf("tenant_admin 列 tA 应 200,得 %d body=%s", st, body)
+	}
+	var rows []scoreRow
+	if e := json.Unmarshal(body, &rows); e != nil {
+		t.Fatalf("解析列表: %v body=%s", e, body)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("tA 应 3 条快照,得 %d: %+v", len(rows), rows)
+	}
+	if rows[0].Subject != "alice" || rows[1].Subject != "bob" || rows[2].Subject != "carol" {
+		t.Fatalf("应按 score 降序 alice>bob>carol,得 %+v", rows)
+	}
+	if rows[0].Level != string(risk.LevelCritical) {
+		t.Fatalf("alice 应 critical,得 %s", rows[0].Level)
+	}
+	for _, rw := range rows { // RLS 隔离实证:tA 列表绝不含 tB 的主体
+		if rw.Subject == "b-only" {
+			t.Fatalf("RLS 泄漏:tA 列表不应含 tB 的 b-only,得 %+v", rows)
+		}
+	}
+
+	// ② 跨租户:tB 的 tenant_admin 列 tA → 403(authz 限本租户)。
+	st, _ = doRaw(t, srv.URL, tbTok, "GET", "/api/v1/tenants/"+tA+"/risk", nil)
+	if st != http.StatusForbidden {
+		t.Fatalf("跨租户列应 403,得 %d", st)
+	}
+
+	// ③ platform_admin 经 path-tid 列任意租户 → 200(读到 tA 的 3 条)。
+	st, body = doRaw(t, srv.URL, platTok, "GET", "/api/v1/tenants/"+tA+"/risk", nil)
+	if st != http.StatusOK {
+		t.Fatalf("platform_admin 经 path-tid 列应 200,得 %d body=%s", st, body)
+	}
+	rows = nil
+	if e := json.Unmarshal(body, &rows); e != nil {
+		t.Fatalf("解析 platform 列表: %v body=%s", e, body)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("platform_admin 列 tA 应 3 条,得 %d", len(rows))
+	}
+
+	// ④ 空租户 → 200 + 空数组(非 null)。
+	st, body = doRaw(t, srv.URL, platTok, "GET", "/api/v1/tenants/"+tEmpty+"/risk", nil)
+	if st != http.StatusOK {
+		t.Fatalf("空租户应 200,得 %d body=%s", st, body)
+	}
+	if string(body) != "[]\n" && string(body) != "[]" {
+		t.Fatalf("空租户应序列化为空数组 [](非 null),得 %q", string(body))
+	}
+}
+
+// TestRiskScoreListEndpointNotConfigured:riskSvc=nil(未装配)→ 503(端点仍在,守路由清单)。
+func TestRiskScoreListEndpointNotConfigured(t *testing.T) {
+	cfg, ok := data.ConfigFromEnv()
+	if !ok {
+		t.Skip("未设 SASE_DB_RW_DSN,跳过")
+	}
+	ctx := context.Background()
+	store, err := data.NewPgxStore(ctx, cfg)
+	if err != nil {
+		t.Fatalf("接 DB: %v", err)
+	}
+	defer store.Close()
+
+	signer, _ := cred.GenerateSigner()
+	verifier, _ := cred.NewVerifier(signer.Public())
+	identitySvc := identity.NewService(store, identity.WithSigner(signer))
+	secSvc := testSecretSvc(t, store)
+
+	mux := http.NewServeMux()
+	httpapi.Register(mux,
+		tenant.NewService(store), identitySvc,
+		policy.NewService(store), resource.NewService(store), audit.NewService(store),
+		swg.NewService(store), site.NewService(store), fw.NewService(store), dlp.NewService(store),
+		enroll.NewService(store, nil),
+		platform.NewService(store), nil, nil, nil,
+		testIDPSvc(t, store, secSvc),
+		nil, nil, verifier, nil, nil,
+		nil, // riskSvc=nil
+	)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	tid := uuid.NewString()
+	platTok, _ := identitySvc.IssueAdminToken(ctx, "plat", authz.RolePlatformAdmin, "", time.Hour)
+	st, body := doRaw(t, srv.URL, platTok, "GET", "/api/v1/tenants/"+tid+"/risk", nil)
+	if st != http.StatusServiceUnavailable {
+		t.Fatalf("riskSvc=nil 应 503,得 %d body=%s", st, body)
+	}
+}
+
 // TestRiskScoreEndpointNotConfigured:riskSvc=nil(未装配)→ 503(端点仍在,守路由清单)。
 func TestRiskScoreEndpointNotConfigured(t *testing.T) {
 	cfg, ok := data.ConfigFromEnv()

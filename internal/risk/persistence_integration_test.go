@@ -102,6 +102,105 @@ func TestRiskNoStore(t *testing.T) {
 	}
 }
 
+// TestRiskListScores:ListScores 列本租户全部快照,验排序(score 降序、subject 升序)+ 空租户空切片。
+func TestRiskListScores(t *testing.T) {
+	store, ctx := newStore(t)
+	svc := risk.NewService(nil, risk.WithStore(store))
+	tid := uuid.NewString()
+
+	// 空租户 → 空切片(非 nil),无快照。
+	got, err := svc.ListScores(ctx, tid)
+	if err != nil {
+		t.Fatalf("空租户 ListScores 应成功,得 %v", err)
+	}
+	if got == nil {
+		t.Fatal("空租户应返回非 nil 空切片(便 JSON 序列化为 [])")
+	}
+	if len(got) != 0 {
+		t.Fatalf("空租户应 0 条,得 %d", len(got))
+	}
+
+	// 落多条:alice critical(90)、bob medium(DLP high=50)、carol low(DLP low=10)。
+	svc.ObservePosture(tid, "alice", "j1", "jailbroken_rooted")                             // score 90 → critical
+	svc.Report(tid, "bob", "j2", dlp.Finding{RuleName: "身份证", Severity: dlp.SeverityHigh})  // score 50 → medium
+	svc.Report(tid, "carol", "j3", dlp.Finding{RuleName: "手机号", Severity: dlp.SeverityLow}) // score 10 → low
+
+	got, err = svc.ListScores(ctx, tid)
+	if err != nil {
+		t.Fatalf("ListScores 应成功,得 %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("应 3 条快照,得 %d: %+v", len(got), got)
+	}
+	// 排序断言:score 降序 → alice(90) > bob(50) > carol(10)。
+	wantOrder := []struct {
+		subject string
+		score   int
+		level   risk.Level
+	}{
+		{"alice", risk.WeightPostureNonCompliant, risk.LevelCritical},
+		{"bob", risk.WeightDLPHigh, risk.LevelMedium},
+		{"carol", risk.WeightDLPLow, risk.LevelLow},
+	}
+	for i, w := range wantOrder {
+		if got[i].Subject != w.subject || got[i].Score != w.score || got[i].Level != w.level {
+			t.Fatalf("第 %d 条应 %s/%d/%s,得 %s/%d/%s(排序或值错)",
+				i, w.subject, w.score, w.level, got[i].Subject, got[i].Score, got[i].Level)
+		}
+		if got[i].UpdatedAt.IsZero() {
+			t.Fatalf("第 %d 条(%s)updated_at 应非零", i, got[i].Subject)
+		}
+	}
+
+	// 同分 subject 升序:再落两条 score 相同(均 DLP low=10)的 d-sub / a-sub。
+	tid2 := uuid.NewString()
+	svc.Report(tid2, "d-sub", "jd", dlp.Finding{RuleName: "r", Severity: dlp.SeverityLow})
+	svc.Report(tid2, "a-sub", "ja", dlp.Finding{RuleName: "r", Severity: dlp.SeverityLow})
+	got2, err := svc.ListScores(ctx, tid2)
+	if err != nil {
+		t.Fatalf("ListScores(tid2): %v", err)
+	}
+	if len(got2) != 2 || got2[0].Subject != "a-sub" || got2[1].Subject != "d-sub" {
+		t.Fatalf("同分应按 subject 升序 a-sub<d-sub,得 %+v", got2)
+	}
+}
+
+// TestRiskListScoresRLSIsolation:RLS 跨租户隔离——租户 B 列不到租户 A 的快照(0 泄漏)。
+func TestRiskListScoresRLSIsolation(t *testing.T) {
+	store, ctx := newStore(t)
+	svc := risk.NewService(nil, risk.WithStore(store))
+	tA := uuid.NewString()
+	tB := uuid.NewString()
+
+	// 租户 A 落两条快照;租户 B 不落任何。
+	svc.ObservePosture(tA, "a-user-1", "j1", "jailbroken_rooted")
+	svc.Report(tA, "a-user-2", "j2", dlp.Finding{RuleName: "身份证", Severity: dlp.SeverityHigh})
+
+	listA, err := svc.ListScores(ctx, tA)
+	if err != nil {
+		t.Fatalf("租户 A ListScores: %v", err)
+	}
+	if len(listA) != 2 {
+		t.Fatalf("租户 A 应列到自己 2 条,得 %d", len(listA))
+	}
+	// 租户 B 列:RLS 必须隔离 → 0 条(读不到 A 的任何行)。
+	listB, err := svc.ListScores(ctx, tB)
+	if err != nil {
+		t.Fatalf("租户 B ListScores: %v", err)
+	}
+	if len(listB) != 0 {
+		t.Fatalf("RLS 隔离:租户 B 不应列到租户 A 的任何快照,得 %d 条: %+v", len(listB), listB)
+	}
+}
+
+// TestRiskListScoresNoStore:未注入 store 的 Service ListScores → ErrNoStore(快照层未启用)。
+func TestRiskListScoresNoStore(t *testing.T) {
+	svc := risk.NewService(nil) // 纯内存,无 WithStore
+	if _, err := svc.ListScores(context.Background(), uuid.NewString()); !errors.Is(err, risk.ErrNoStore) {
+		t.Fatalf("未配 store 应 ErrNoStore,得 %v", err)
+	}
+}
+
 // assertRowCount 在租户 RLS 上下文内断言 risk_scores 行数(验 upsert 单行,非追加)。
 func assertRowCount(t *testing.T, ctx context.Context, store data.Store, tid, subject string, want int) {
 	t.Helper()

@@ -67,6 +67,8 @@ var AdminRoutePatterns = []string{
 	"GET /api/v1/tenants/{tid}/audit",
 	// 风险评分快照只读查询(risk RLS 持久化):某主体最新风险快照。handler 用 path tid 做 RLS 上下文。
 	"GET /api/v1/tenants/{tid}/risk/{subject}",
+	// 风险评分快照列表(N2):列本租户全部快照(score 降序、subject 升序)。handler 用 path tid 做 RLS 上下文。
+	"GET /api/v1/tenants/{tid}/risk",
 	"POST /api/v1/tenants/{tid}/idp/configs",
 	"GET /api/v1/tenants/{tid}/idp/configs",
 	"GET /api/v1/tenants/{tid}/idp/configs/{cid}",
@@ -136,6 +138,8 @@ func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity
 		"GET /api/v1/tenants/{tid}/audit":               listAudit(auditSvc),
 		// 风险评分快照只读查询(risk RLS 持久化):riskSvc nil → 503;快照层未配 → 503;无快照 → 404。
 		"GET /api/v1/tenants/{tid}/risk/{subject}": getRiskScore(riskSvc),
+		// 风险评分快照列表(N2):列本租户全部快照(score 降序、subject 升序)。riskSvc nil / 快照层未配 → 503。
+		"GET /api/v1/tenants/{tid}/risk": listRiskScores(riskSvc),
 		// IdP 配置 CRUD(Slice36,secret 模块首个加密消费者:client_secret 经租户 DEK 加密落库)
 		"POST /api/v1/tenants/{tid}/idp/configs":         createIDPConfig(idpSvc),
 		"GET /api/v1/tenants/{tid}/idp/configs":          listIDPConfigs(idpSvc),
@@ -1085,6 +1089,30 @@ func getRiskScore(riskSvc *risk.Service) http.HandlerFunc {
 			http.Error(w, "查询风险快照失败", http.StatusInternalServerError)
 		default:
 			writeJSON(w, http.StatusOK, sc)
+		}
+	}
+}
+
+// listRiskScores 列本租户全部风险快照(N2;score 降序、subject 升序)。handler 用 **path tid 做 RLS 上下文**
+// (platform_admin TenantID 空,经 path-tid RLS 可读任意租户;对齐 getRiskScore/listPolicies/listUsers 模式)。
+// authz 已守作用域:tenant_admin/auditor 限本租户、platform_admin 任意。
+// riskSvc nil(测试/未装配)或快照层未配(WithStore 未注入)→ 503;内部错脱敏(log + 通用文案)。
+func listRiskScores(riskSvc *risk.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if riskSvc == nil {
+			http.Error(w, "risk 服务未配置", http.StatusServiceUnavailable)
+			return
+		}
+		tid := r.PathValue("tid")
+		scs, err := riskSvc.ListScores(r.Context(), tid)
+		switch {
+		case errors.Is(err, risk.ErrNoStore):
+			http.Error(w, "风险快照持久化未启用", http.StatusServiceUnavailable)
+		case err != nil:
+			log.Printf("[admin] listRiskScores tid=%s failed: %v", tid, err)
+			http.Error(w, "查询风险快照失败", http.StatusInternalServerError)
+		default:
+			writeJSON(w, http.StatusOK, scs)
 		}
 	}
 }
