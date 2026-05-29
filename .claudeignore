@@ -1,0 +1,7 @@
+# 排除生成物/构建产物,避免进 Claude 上下文(参考大仓最佳实践)
+/output/
+*.tgz
+*.test
+*.out
+# Go 缓存/vendor(如有)
+/vendor/

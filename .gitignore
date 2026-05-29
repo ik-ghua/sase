@@ -1,0 +1,25 @@
+.mcp-atlassian.env
+.uv-cache/
+.uv-python/
+.uv-tools/
+.venv-mcp-atlassian/
+
+# Go
+/output/
+*.out
+*.test
+.DS_Store
+
+# 杂项工具缓存
+.cache/
+.corepack/
+
+# dev 自签 mTLS 证书(含私钥;经 `OUT=./certs go run ./cmd/devpki` 可重新生成,绝不入库)
+/certs/
+
+# pnpm 内容寻址存储(巨大;前端依赖另由 web/*/.gitignore 处理)
+/.pnpm-store/
+
+# 外部/参考资料(非本仓代码:clean-room 不入库 + 体量大)
+/tools/
+/.tmp-open-design/

@@ -1,0 +1,29 @@
+# golangci-lint 配置(SASE monorepo)。务实集:正确性 + 安全 + 资源 + 风格。
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - errcheck      # 未处理的 error
+    - govet         # go vet
+    - staticcheck   # 静态分析(含 SA 系列)
+    - ineffassign   # 无效赋值
+    - unused        # 未用代码
+    - gosec         # 安全(注入/弱随机/硬编码凭据等)
+    - revive        # 风格(替代 golint)
+    - misspell      # 拼写
+    - gocritic      # 常见反模式
+    - unconvert     # 多余类型转换
+    - prealloc      # 可预分配的 slice
+    - bodyclose     # HTTP body 未关闭(资源泄漏)
+    - contextcheck  # context 传递
+    - nilerr        # return nil 但 err != nil
+
+issues:
+  exclude-rules:
+    # 测试文件放宽:安全扫描/错误检查
+    - path: _test\.go
+      linters: [gosec, errcheck, bodyclose]
+  max-issues-per-linter: 0
+  max-same-issues: 0
