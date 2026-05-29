@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -54,6 +55,16 @@ func run() error {
 	srv := xds.NewServer(ctx, store)
 	rec := metrics.NewControlRecorder()
 	srv.SetMetrics(rec)
+
+	// 订阅授权(控制面隔离不变量,xDS server L2 §3.8 + L1 3.12)。SASE_XDS_REQUIRE_CERT_SCOPE=1
+	// 开严格模式:role-less / 无证书订阅被拒(生产硬化,同 W9 SASE_REQUIRE_CERT_TENANT 形态)。
+	// **role:device 跨租户订阅在两种模式都拒**(确定越权);严格开关只决定 role-less 宽严。
+	if truthy(os.Getenv("SASE_XDS_REQUIRE_CERT_SCOPE")) {
+		srv.SetStrictSubAuth(true)
+		log.Printf("[xds-server] 订阅授权:严格模式(role-less/无证书订阅被拒;role:device 跨租户始终拒)")
+	} else {
+		log.Printf("[xds-server] 订阅授权:宽松模式(dev;role:device 跨租户仍拒,role-less 放行;生产须设 SASE_XDS_REQUIRE_CERT_SCOPE=1)")
+	}
 	srv.Register(gs)
 
 	// 可观测:/metrics(明文内部抓取,xDS 下发健康,运维 L2 3.10)
@@ -111,6 +122,16 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// truthy 解析布尔型 env(1/true/yes/on 为真);用于 SASE_XDS_REQUIRE_CERT_SCOPE 等开关。
+func truthy(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // reconcileInterval 取周期对账间隔(SASE_XDS_RECONCILE_INTERVAL,默认 30s;非法/未设 → 30s)。

@@ -15,10 +15,13 @@ import (
 	"log"
 	"sync"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	serverv3 "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	xdspb "github.com/ikuai8/sase/api/proto/sase/xds/v1"
 	"github.com/ikuai8/sase/internal/data"
@@ -46,13 +49,25 @@ type Server struct {
 	dlpCache    *cachev3.LinearCache
 	mux         *cachev3.MuxCache
 	rec         *metrics.ControlRecorder
-	// subscribed 记录已订阅过的租户(onDeltaRequest 登记);ReconcileAll 据此重读,
-	// 兜底断连期间丢失的 LISTEN/NOTIFY(listen.go 注:NOTIFY 不持久)。sync.Map 并发安全。
-	subscribed sync.Map // map[tenantID]struct{}
+
+	// strictSubAuth:订阅授权严格模式(SASE_XDS_REQUIRE_CERT_SCOPE=1)。开启时 role-less / 无证书
+	// 订阅被拒(生产硬化);关闭时放行(dev 兼容)。role:device 跨租户拒不受此开关影响(始终生效)。
+	strictSubAuth bool
+
+	// streams:streamID → *streamAuth。onDeltaStreamOpen 据证书登记、onDeltaStreamClosed 删除。
+	streams sync.Map
+
+	// refMu 守 tenantRefs 与各 streamAuth.tenants:某租户的活跃订阅流数;归零 → 从对账集移除 + 驱逐缓存。
+	// 取代旧 subscribed sync.Map(单调增长、断连不收缩):现按订阅生命周期增减,止住膨胀 + ReconcileAll 不对死租户空转。
+	refMu      sync.Mutex
+	tenantRefs map[string]int
 }
 
 // SetMetrics 注入控制面指标记录器(可选;nil 为 no-op)。
 func (s *Server) SetMetrics(rec *metrics.ControlRecorder) { s.rec = rec }
+
+// SetStrictSubAuth 开启订阅授权严格模式(role-less / 无证书订阅被拒);由 cmd 经 env 门控装配。
+func (s *Server) SetStrictSubAuth(strict bool) { s.strictSubAuth = strict }
 
 // NewServer 构造 xDS server。ctx 为服务生命周期。
 func NewServer(ctx context.Context, store data.Store) *Server {
@@ -69,25 +84,120 @@ func NewServer(ctx context.Context, store data.Store) *Server {
 			policyTypeURL: policyCache, revTypeURL: revCache, swgTypeURL: swgCache, siteTypeURL: siteCache, fwTypeURL: fwCache, dlpTypeURL: dlpCache,
 		},
 	}
-	return &Server{ctx: ctx, store: store, policyCache: policyCache, revCache: revCache, swgCache: swgCache, siteCache: siteCache, fwCache: fwCache, dlpCache: dlpCache, mux: mux}
+	return &Server{ctx: ctx, store: store, policyCache: policyCache, revCache: revCache, swgCache: swgCache, siteCache: siteCache, fwCache: fwCache, dlpCache: dlpCache, mux: mux, tenantRefs: map[string]int{}}
 }
 
 // Register 把 ADS 服务注册到 gRPC server(mTLS creds 由调用方在 grpc.NewServer 时提供,L2 3.9)。
 func (s *Server) Register(gs *grpc.Server) {
 	srv := serverv3.NewServer(s.ctx, s.mux, serverv3.CallbackFuncs{
-		StreamDeltaRequestFunc: s.onDeltaRequest,
+		DeltaStreamOpenFunc:    s.onDeltaStreamOpen,   // 开流取证书登记身份(每流一次,带 ctx)
+		DeltaStreamClosedFunc:  s.onDeltaStreamClosed, // 关流退订计数 + 驱逐无订阅者租户缓存
+		StreamDeltaRequestFunc: s.onDeltaRequest,      // 每订阅请求复查租户授权
 	})
 	discoveryv3.RegisterAggregatedDiscoveryServiceServer(gs, srv)
 }
 
-// onDeltaRequest:按 type URL 区分,读对应租户资源入缓存(go-control-plane 据订阅推送)。
-func (s *Server) onDeltaRequest(_ int64, req *discoveryv3.DeltaDiscoveryRequest) error {
-	for _, name := range req.GetResourceNamesSubscribe() {
-		tid := tenantFromName(name)
-		if tid == "" {
-			continue
+// onDeltaStreamOpen 在每条 Delta 流开流时(go-control-plane 保证每流一次且带 ctx)从已验证 mTLS
+// 叶证书提取身份并按 streamID 登记,供后续 onDeltaRequest 复查订阅授权。无证书 → hasCert=false。
+func (s *Server) onDeltaStreamOpen(ctx context.Context, streamID int64, _ string) error {
+	role, certTenant, hasCert := peerCertIdentity(ctx)
+	s.streams.Store(streamID, &streamAuth{role: role, certTenant: certTenant, hasCert: hasCert, tenants: map[string]bool{}, namedTypes: map[string]bool{}})
+	return nil
+}
+
+// onDeltaStreamClosed 在 Delta 流关闭时退订:本流订阅过的租户引用计数 -1,归零的租户从对账集移除
+// 并驱逐其 6 类缓存资源(止住 tenantRefs 单调增长 + ReconcileAll 不对死租户空转;下个订阅者连上时
+// 由 onDeltaRequest 惰性重载,xDS server L2 §3.4 降量)。驱逐持 refMu 与 recordRef 串行,
+// 避免「驱逐 vs 新订阅惰性重载」竞态(归零只发生在最后一个订阅者离开、此时无并发 load)。
+func (s *Server) onDeltaStreamClosed(streamID int64, _ *corev3.Node) {
+	v, ok := s.streams.LoadAndDelete(streamID)
+	if !ok {
+		return
+	}
+	sa := v.(*streamAuth)
+	s.refMu.Lock()
+	defer s.refMu.Unlock()
+	for tid := range sa.tenants {
+		if n := s.tenantRefs[tid] - 1; n <= 0 {
+			delete(s.tenantRefs, tid)
+			s.evictTenant(tid)
+		} else {
+			s.tenantRefs[tid] = n
 		}
-		s.subscribed.Store(tid, struct{}{}) // 登记:供 ReconcileAll 断连/周期对账重读
+	}
+}
+
+// authFor 取 streamID 的身份;未经 onDeltaStreamOpen(如直接单测调用 / 异常路径)→ 视作无证书 role-less
+// 惰性建一份(LoadOrStore 防并发重复)。
+func (s *Server) authFor(streamID int64) *streamAuth {
+	if v, ok := s.streams.Load(streamID); ok {
+		return v.(*streamAuth)
+	}
+	actual, _ := s.streams.LoadOrStore(streamID, &streamAuth{tenants: map[string]bool{}, namedTypes: map[string]bool{}})
+	return actual.(*streamAuth)
+}
+
+// recordRef 登记本流对 typeURL 的具名订阅:① 标记 namedTypes[typeURL](后续空 ACK 据此放行,防 wildcard);
+// ② 首次订阅 tid → tenantRefs[tid]++(进 ReconcileAll 集);重复订阅同租户不重复计数。
+func (s *Server) recordRef(sa *streamAuth, tid, typeURL string) {
+	s.refMu.Lock()
+	defer s.refMu.Unlock()
+	sa.namedTypes[typeURL] = true
+	if !sa.tenants[tid] {
+		sa.tenants[tid] = true
+		s.tenantRefs[tid]++
+	}
+}
+
+// evictTenant 从全 6 类缓存删除该租户资源(无活跃订阅者后降量)。调用方须持 refMu。
+// DeleteResource 对不存在的名返非致命错误,忽略。
+func (s *Server) evictTenant(tid string) {
+	name := xdspb.ResourceName(tid)
+	for _, c := range []*cachev3.LinearCache{s.policyCache, s.revCache, s.swgCache, s.siteCache, s.fwCache, s.dlpCache} {
+		_ = c.DeleteResource(name)
+	}
+	log.Printf("[xds] 驱逐 tenant=%s(无活跃订阅,缓存降量)", tid)
+}
+
+// onDeltaRequest:按 type URL 区分,复查订阅租户授权后读对应租户资源入缓存(go-control-plane 据订阅推送)。
+// **授权(本刀核心)**:每个订阅的 tenant/<id> 经 authorizeSubscription 比对本流证书 role/绑定租户;
+// 未授权(role:device 跨租户 / 严格模式 role-less)返 PermissionDenied —— go-control-plane 据此终止该流
+// (delta server.go:180 `return err`),拒绝把他租户资源下发给越权订阅者。
+//
+// **防 wildcard 旁路(评审 H1)**:go-control-plane 对「首个请求 ResourceNamesSubscribe 为空」的流置为
+// wildcard watch,会从共享缓存返回**所有租户**资源(绕过逐租户授权)。SASE 客户端一律具名订阅
+// tenant/<id>(internal/pop/client.go),从不用 wildcard;故:① 流尚未具名订阅过即发空订阅(=wildcard
+// 触发)→ 拒;② 已具名订阅后的空请求 = ACK(client.go 收响应后回 ResponseNonce + 空订阅)→ 放行;
+// ③ 资源名非 tenant/<id>(含显式 "*")→ tenantFromName 返空 → 拒(此前 continue 静默放过是泄漏口)。
+func (s *Server) onDeltaRequest(streamID int64, req *discoveryv3.DeltaDiscoveryRequest) error {
+	sa := s.authFor(streamID)
+	subs := req.GetResourceNamesSubscribe()
+	typeURL := req.GetTypeUrl()
+
+	if len(subs) == 0 {
+		// 空订阅:仅当本流已为该 typeURL 具名订阅过(=后续 ACK)才放行;否则即 wildcard 首请求 → 拒
+		// (go-control-plane 按 (流,typeURL) 首请求空订阅置 wildcard watch,会回该类全部租户资源)。
+		s.refMu.Lock()
+		acked := sa.namedTypes[typeURL]
+		s.refMu.Unlock()
+		if !acked {
+			log.Printf("[xds] 拒绝 wildcard 订阅 stream=%d type=%q role=%q certTenant=%q(SASE 客户端须具名订阅 tenant/<id>)", streamID, typeURL, sa.role, sa.certTenant)
+			return status.Error(codes.PermissionDenied, "wildcard 订阅被拒:须具名订阅 tenant/<id>")
+		}
+		return nil // 已具名订阅该 typeURL 后的空请求 = ACK,放行
+	}
+
+	for _, name := range subs {
+		tid := tenantFromName(name)
+		if tid == "" { // 非 tenant/<id>(含 wildcard 资源名 "*")→ 拒,绝不静默放过
+			log.Printf("[xds] 拒绝非法订阅资源名 stream=%d name=%q(须 tenant/<id>)", streamID, name)
+			return status.Errorf(codes.PermissionDenied, "非法订阅资源名 %q:须 tenant/<id>", name)
+		}
+		if ok, reason := authorizeSubscription(sa.role, sa.hasCert, sa.certTenant, tid, s.strictSubAuth); !ok {
+			log.Printf("[xds] 拒绝订阅 stream=%d role=%q certTenant=%q → tenant=%s:%s", streamID, sa.role, sa.certTenant, tid, reason)
+			return status.Errorf(codes.PermissionDenied, "订阅租户 %s 被拒:%s", tid, reason)
+		}
+		s.recordRef(sa, tid, typeURL) // 退订计数 + 维护 tenantRefs(供 ReconcileAll + 驱逐)+ 记该 typeURL 已具名
 		switch req.GetTypeUrl() {
 		case policyTypeURL:
 			s.loadTenant(tid)
@@ -124,25 +234,30 @@ func (s *Server) OnFWNotify(tenantID string) { s.loadFW(tenantID) }
 // OnDLPNotify 由 DLP 规则变更 LISTEN/NOTIFY 回调:重读该租户 DLP 规则入缓存(独立流下发)。
 func (s *Server) OnDLPNotify(tenantID string) { s.loadDLP(tenantID) }
 
-// ReconcileAll 对所有已订阅租户重读全部 6 类资源入缓存,**兜底断连期间丢失的 LISTEN/NOTIFY**
+// ReconcileAll 对所有**有活跃订阅**的租户重读全部 6 类资源入缓存,**兜底断连期间丢失的 LISTEN/NOTIFY**
 // (listen.go 注:NOTIFY 不持久,断连期间通知会丢;xDS server L2 3.5 须重连后/周期全量对账)。
 // 由 cmd 在 LISTEN 重连后(撤销通道,秒级安全)+ 周期 ticker(兜底,默认 30s)调用。
 // 全 6 个 load* 幂等(UpdateResource 覆盖),重复调用安全;无激活 bundle 的租户 loadTenant 自跳过。
+// 在锁外做 DB I/O:先持 refMu 快照活跃租户集,释放后再 load(避免持锁 I/O;无订阅者的租户不空转,
+// 因关流已驱逐 + 从 tenantRefs 移除)。
 func (s *Server) ReconcileAll() {
-	n := 0
-	s.subscribed.Range(func(k, _ any) bool {
-		tid := k.(string)
+	s.refMu.Lock()
+	tids := make([]string, 0, len(s.tenantRefs))
+	for tid := range s.tenantRefs {
+		tids = append(tids, tid)
+	}
+	s.refMu.Unlock()
+
+	for _, tid := range tids {
 		s.loadTenant(tid)
 		s.loadRevocations(tid)
 		s.loadSWG(tid)
 		s.loadSites(tid)
 		s.loadFW(tid)
 		s.loadDLP(tid)
-		n++
-		return true
-	})
-	if n > 0 {
-		log.Printf("[xds] 全量对账:%d 租户 × 6 资源(兜底丢失的 NOTIFY)", n)
+	}
+	if len(tids) > 0 {
+		log.Printf("[xds] 全量对账:%d 租户 × 6 资源(兜底丢失的 NOTIFY)", len(tids))
 	}
 }
 
