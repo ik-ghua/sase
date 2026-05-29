@@ -1512,6 +1512,48 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tenants/{tid}/devices": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 租户 ID(UUID) */
+                tid: components["parameters"]["Tid"];
+            };
+            cookie?: never;
+        };
+        /** 列出本租户已登记设备(ZTP 可见性;只读;只含非敏感字段,不含激活码;platform_admin 经 path-tid RLS 可读任意租户) */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description 租户 ID(UUID) */
+                    tid: components["parameters"]["Tid"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Device"][];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tenants/{tid}/devices/revoke": {
         parameters: {
             query?: never;
@@ -2631,6 +2673,23 @@ export interface components {
             email?: string;
             /** @enum {string} */
             status?: "active" | "disabled";
+        };
+        /** @description 设备入网记录的非敏感只读视图(ZTP 可见性);有意不含 activation_code(一次性激活码=秘密)。 */
+        Device: {
+            id?: string;
+            /** @enum {string} */
+            kind?: "connector" | "cpe";
+            /** @description 签入证书 CommonName(connector app / cpe site_key) */
+            identity?: string;
+            /** @enum {string} */
+            status?: "pending" | "redeemed" | "revoked";
+            /**
+             * Format: date-time
+             * @description 兑换时刻;未兑换为 null
+             */
+            redeemed_at?: string | null;
+            /** Format: date-time */
+            created_at?: string;
         };
         App: {
             id?: string;

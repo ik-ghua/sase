@@ -90,6 +90,8 @@ var AdminRoutePatterns = []string{
 	"DELETE /api/v1/tenants/{tid}/dlp/rules/{id}",
 	"POST /api/v1/tenants/{tid}/enrollments",
 	"POST /api/v1/tenants/{tid}/devices/revoke",
+	// 已登记设备列表(ZTP 可见性,M2):只读,只暴露非敏感列(不含激活码)。handler 用 path tid 做 RLS 上下文。
+	"GET /api/v1/tenants/{tid}/devices",
 	"GET /api/v1/platform/tenants",
 	"POST /api/v1/platform/tenants/{tid}/decommission",
 	"POST /api/v1/platform/tenants/{tid}/decommission/cancel",
@@ -162,6 +164,8 @@ func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity
 		"DELETE /api/v1/tenants/{tid}/dlp/rules/{id}":    deleteDLPRule(dlpSvc),
 		"POST /api/v1/tenants/{tid}/enrollments":         createEnrollment(enrollSvc),
 		"POST /api/v1/tenants/{tid}/devices/revoke":      revokeDevice(enrollSvc),
+		// 已登记设备列表(M2):handler 用 path tid 做 RLS;platform_admin 经 path-tid 读任意租户(对齐 listUsers/listPolicies)。
+		"GET /api/v1/tenants/{tid}/devices": listDevices(enrollSvc),
 		// 平台跨租户(PC-API-1):全租户列表。authz 默认分支已限 platform_admin;经 platform 模块 InPlatformTx 读策展视图。
 		"GET /api/v1/platform/tenants": listPlatformTenants(platformSvc),
 		// 平台租户注销宽限期(PC-API-2b):/platform/* 经 authz 默认分支限 platform_admin(租户管理员不能注销自身)。
@@ -996,6 +1000,22 @@ func revokeDevice(svc enroll.Service) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "identity": body.Identity})
+	}
+}
+
+// listDevices 列出该租户已登记设备(ZTP 可见性,M2)。handler 用 **path tid 做 RLS 上下文**
+// (platform_admin TenantID 空,经 path-tid RLS 可读任意租户;对齐 listUsers/listPolicies/getRiskScore 模式)。
+// authz 已守作用域:tenant_admin/auditor 限本租户、platform_admin 任意。
+// 只返回非敏感列(enroll.Device 不含激活码);内部错脱敏(log + 通用文案,不泄漏 DB 细节)。
+func listDevices(svc enroll.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ds, err := svc.ListDevices(r.Context(), r.PathValue("tid"))
+		if err != nil {
+			log.Printf("[admin] listDevices tid=%s failed: %v", r.PathValue("tid"), err)
+			http.Error(w, "list devices failed", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, ds)
 	}
 }
 

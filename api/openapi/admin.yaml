@@ -328,6 +328,13 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateEnrollmentRequest' } } } }
       responses: { '201': { description: 已生成, content: { application/json: { schema: { $ref: '#/components/schemas/ActivationCode' } } } } }
 
+  /api/v1/tenants/{tid}/devices:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    get:
+      tags: [enrollment]
+      summary: 列出本租户已登记设备(ZTP 可见性;只读;只含非敏感字段,不含激活码;platform_admin 经 path-tid RLS 可读任意租户)
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Device' } } } } } }
+
   /api/v1/tenants/{tid}/devices/revoke:
     parameters: [ { $ref: '#/components/parameters/Tid' } ]
     post:
@@ -722,6 +729,16 @@ components:
         external_id: { type: string, description: IdP 侧主键 }
         email:       { type: string }
         status:      { type: string, enum: [active, disabled] }
+    Device:
+      type: object
+      description: 设备入网记录的非敏感只读视图(ZTP 可见性);有意不含 activation_code(一次性激活码=秘密)。
+      properties:
+        id:          { type: string }
+        kind:        { type: string, enum: [connector, cpe] }
+        identity:    { type: string, description: 签入证书 CommonName(connector app / cpe site_key) }
+        status:      { type: string, enum: [pending, redeemed, revoked] }
+        redeemed_at: { type: [string, "null"], format: date-time, description: 兑换时刻;未兑换为 null }
+        created_at:  { type: string, format: date-time }
     App:
       type: object
       properties:

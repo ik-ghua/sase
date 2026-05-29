@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -30,6 +31,18 @@ const (
 
 func validKind(k string) bool { return k == KindConnector || k == KindCPE }
 
+// Device 是设备入网记录的**非敏感**只读视图(供 ZTP 可见性端点列出)。
+// 有意不含 activation_code(一次性激活码=秘密,泄漏即可被冒充兑换):入网记录里唯一的敏感字段。
+// identity 是设备自报的身份(connector app / cpe site_key),非秘密;证书/私钥从不存于本表(私钥永不离开设备)。
+type Device struct {
+	ID         string     `json:"id"`
+	Kind       string     `json:"kind"`     // connector | cpe
+	Identity   string     `json:"identity"` // 签入证书 CommonName(connector app / cpe site_key)
+	Status     string     `json:"status"`   // pending | redeemed | revoked
+	RedeemedAt *time.Time `json:"redeemed_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+}
+
 // Service 是 enroll 模块对外唯一接口。
 type Service interface {
 	// CreateEnrollment 由管理面(RBAC)为某设备预置一条入网记录,返回一次性激活码。
@@ -41,6 +54,8 @@ type Service interface {
 	Renew(ctx context.Context, tenantID, identity string, csrPEM []byte) (certPEM []byte, err error)
 	// RevokeDevice 由管理面(RBAC)撤销设备入网:置 status='revoked',此后续期被拒(设备 ≤证书有效期内掉线)。
 	RevokeDevice(ctx context.Context, tenantID, identity string) error
+	// ListDevices 列出该租户已登记设备(ZTP 可见性)。经 InTxRO 走 RLS,只返回**非敏感**列(不含激活码)。
+	ListDevices(ctx context.Context, tenantID string) ([]Device, error)
 }
 
 // AuditFunc 记录 ZTP 证书签发/续期事件(设备认证、非 admin principal,故不经 admin 审计中间件,单独记)。
@@ -201,4 +216,35 @@ func (s *service) RevokeDevice(ctx context.Context, tenantID, identity string) e
 		}
 		return nil
 	})
+}
+
+// ListDevices 列出该租户已登记设备(ZTP 可见性)。经 InTxRO(app_ro)走 RLS,只 SELECT **非敏感**列
+// (id/kind/identity/status/redeemed_at/created_at)——**绝不**取 activation_code(一次性秘密)。
+// 按 created_at 排序;空返非 nil 空切片(序列化为 [] 而非 null,对齐 identity.ListByTenant/policy.ListByTenant)。
+func (s *service) ListDevices(ctx context.Context, tenantID string) ([]Device, error) {
+	var out []Device
+	err := s.store.InTxRO(ctx, tenantID, func(q data.Queries) error {
+		rows, qerr := q.Query(ctx,
+			`SELECT id, kind, identity, status, redeemed_at, created_at
+			   FROM device_enrollments ORDER BY created_at`)
+		if qerr != nil {
+			return fmt.Errorf("enroll.ListDevices query: %w", qerr)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var d Device
+			if scanErr := rows.Scan(&d.ID, &d.Kind, &d.Identity, &d.Status, &d.RedeemedAt, &d.CreatedAt); scanErr != nil {
+				return fmt.Errorf("enroll.ListDevices scan: %w", scanErr)
+			}
+			out = append(out, d)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []Device{}
+	}
+	return out, nil
 }
