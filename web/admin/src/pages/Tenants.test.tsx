@@ -67,6 +67,10 @@ describe('Tenants 页', () => {
       if (path === '/api/v1/tenants/{tid}/risk/{subject}') {
         return Promise.resolve({ data: undefined, response: { ok: false, status: 404 } });
       }
+      // Slice69 租户级风险概览(list):默认空数组
+      if (path === '/api/v1/tenants/{tid}/risk') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
       return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
     });
   });
@@ -247,6 +251,9 @@ describe('Tenants 页', () => {
           response: { ok: true, status: 200 },
         });
       }
+      if (path === '/api/v1/tenants/{tid}/risk') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
       return Promise.resolve({ data: [activeTenant], response: { ok: true, status: 200 } });
     });
     renderWith();
@@ -281,6 +288,10 @@ describe('Tenants 页', () => {
       }
       if (path === '/api/v1/tenants/{tid}/risk/{subject}') {
         return Promise.resolve(riskResp);
+      }
+      // Slice69 租户级风险概览(list):本组测试聚焦 per-user 懒查列,概览区给空。
+      if (path === '/api/v1/tenants/{tid}/risk') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
       }
       return Promise.resolve({ data: [activeTenant], response: { ok: true, status: 200 } });
     });
@@ -323,5 +334,85 @@ describe('Tenants 页', () => {
     await waitFor(() => expect(screen.getByText('alice@t.io')).toBeInTheDocument());
     fireEvent.click(screen.getByRole('button', { name: /查看风险/ }));
     await waitFor(() => expect(screen.getByText('未评估')).toBeInTheDocument());
+  });
+
+  // ---- Slice69 租户级「风险概览」区(list 端点,懒加载)----
+
+  // path-aware mock:overviewResp 决定 GET /risk(list)行为;其余区给最小空数据。
+  function mockWithRiskOverview(overviewResp: {
+    data?: unknown;
+    error?: unknown;
+    response: { ok: boolean; status: number };
+  }) {
+    mockGET.mockImplementation((path: string) => {
+      if (path === '/api/v1/tenants/{tid}/users') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/policies/bundle') {
+        return Promise.resolve({ data: null, response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/policies') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/risk/{subject}') {
+        return Promise.resolve({ data: undefined, response: { ok: false, status: 404 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/risk') {
+        return Promise.resolve(overviewResp);
+      }
+      return Promise.resolve({ data: [activeTenant], response: { ok: true, status: 200 } });
+    });
+  }
+
+  it('风险概览:Drawer 打开懒加载 → 渲染主体行 + level Tag + score(score 降序保持)', async () => {
+    mockWithRiskOverview({
+      data: [
+        { subject: 'ext-hot', score: 92, level: 'critical', updated_at: '2026-05-29T08:00:00Z' },
+        { subject: 'ext-mild', score: 40, level: 'medium', updated_at: '2026-05-29T07:00:00Z' },
+      ],
+      response: { ok: true, status: 200 },
+    });
+    renderWith();
+    await waitFor(() => expect(screen.getByText('TenantA')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /详情/ }));
+    // 概览区标题 + 主体行(后端按 score 降序,前端保持次序)
+    await waitFor(() => expect(screen.getByText('风险概览')).toBeInTheDocument());
+    expect(await screen.findByText('ext-hot')).toBeInTheDocument();
+    expect(screen.getByText('ext-mild')).toBeInTheDocument();
+    // level Tag + score
+    expect(screen.getByText('critical')).toBeInTheDocument();
+    expect(screen.getByText('92')).toBeInTheDocument();
+    expect(screen.getByText('medium')).toBeInTheDocument();
+    expect(screen.getByText('40')).toBeInTheDocument();
+    // 懒加载发起的是 list 端点(无 {subject})
+    await waitFor(() =>
+      expect(mockGET).toHaveBeenCalledWith('/api/v1/tenants/{tid}/risk', {
+        params: { path: { tid: activeTenant.id } },
+      }),
+    );
+  });
+
+  it('风险概览:空(无评估主体)→ 显「暂无风险评估」', async () => {
+    mockWithRiskOverview({ data: [], response: { ok: true, status: 200 } });
+    renderWith();
+    await waitFor(() => expect(screen.getByText('TenantA')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /详情/ }));
+    await waitFor(() => expect(screen.getByText('风险概览')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('暂无风险评估')).toBeInTheDocument());
+  });
+
+  it('风险概览:503(快照持久化未启用)→ 显可读提示', async () => {
+    mockWithRiskOverview({
+      data: undefined,
+      error: 'snapshots disabled',
+      response: { ok: false, status: 503 },
+    });
+    renderWith();
+    await waitFor(() => expect(screen.getByText('TenantA')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /详情/ }));
+    await waitFor(() => expect(screen.getByText('风险概览')).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText('风险快照持久化未启用')).toBeInTheDocument(),
+    );
   });
 });

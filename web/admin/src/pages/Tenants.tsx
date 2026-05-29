@@ -150,6 +150,16 @@ async function fetchUserRisk(tid: string, subject: string): Promise<RiskScore | 
   return (data as RiskScore) ?? null;
 }
 
+// Slice69:本租户全部已评估主体的风险快照(score 降序,后端已排,前端保持)。
+// 空租户 → [];503(快照持久化未启用)→ 抛 ApiError(UI 显可读提示)。
+async function fetchTenantRisks(tid: string): Promise<RiskScore[]> {
+  const { data, error, response } = await client.GET('/api/v1/tenants/{tid}/risk', {
+    params: { path: { tid } },
+  });
+  if (error || !response.ok) throw toApiError(response, error);
+  return data ?? [];
+}
+
 function formatDate(s?: string | null): string {
   if (!s) return '-';
   try {
@@ -345,6 +355,12 @@ export default function Tenants() {
   const policiesQuery = useQuery({
     queryKey: ['tenant-policies', detailTid],
     queryFn: () => fetchTenantPolicies(detailTid),
+    enabled: detailTid !== '',
+  });
+  // Slice69:租户级风险概览(所有已评估主体,score 降序)— 与用户/策略区同款懒加载。
+  const risksQuery = useQuery({
+    queryKey: ['tenant-risks', detailTid],
+    queryFn: () => fetchTenantRisks(detailTid),
     enabled: detailTid !== '',
   });
 
@@ -688,6 +704,71 @@ export default function Tenants() {
                         {e ?? '-'}
                       </Tag>
                     ),
+                  },
+                ]}
+              />
+            )}
+
+            {/* Slice69:租户级风险概览(只读;列出所有已评估主体,top-risk 在前)。
+                与用户表里的 per-user 懒查风险列(Slice68/N3)并存:此处是独立的租户级概览区。*/}
+            <Divider>风险概览</Divider>
+            {risksQuery.isError ? (
+              // 503(快照持久化未启用)单独可读提示;其它错走 AppError。
+              risksQuery.error instanceof ApiError && risksQuery.error.status === 503 ? (
+                <Alert
+                  type="info"
+                  showIcon
+                  message="风险快照持久化未启用"
+                  description="风险评分权威态在内存;未启用持久化时无落库快照可列。"
+                />
+              ) : (
+                <AppError error={risksQuery.error} onRetry={() => risksQuery.refetch()} />
+              )
+            ) : (
+              <Table<RiskScore>
+                rowKey={(r) => r.subject ?? ''}
+                size="small"
+                loading={risksQuery.isFetching}
+                dataSource={risksQuery.data ?? []}
+                pagination={{ pageSize: 5, hideOnSinglePage: true, size: 'small' }}
+                locale={{ emptyText: '暂无风险评估' }}
+                columns={[
+                  {
+                    title: '主体',
+                    dataIndex: 'subject',
+                    key: 'subject',
+                    ellipsis: true,
+                    render: (v?: string) => v || '-',
+                  },
+                  {
+                    title: '等级',
+                    dataIndex: 'level',
+                    key: 'level',
+                    width: 100,
+                    render: (level?: string) => (
+                      <Tag color={RISK_LEVEL_COLORS[level ?? ''] ?? 'default'}>
+                        {level || 'unknown'}
+                      </Tag>
+                    ),
+                  },
+                  {
+                    title: '评分',
+                    dataIndex: 'score',
+                    key: 'score',
+                    width: 80,
+                    render: (s?: number) =>
+                      typeof s === 'number' ? (
+                        <Typography.Text style={{ fontFamily: 'var(--font-mono)' }}>{s}</Typography.Text>
+                      ) : (
+                        '-'
+                      ),
+                  },
+                  {
+                    title: '更新时间',
+                    dataIndex: 'updated_at',
+                    key: 'updated_at',
+                    width: 170,
+                    render: formatDate,
                   },
                 ]}
               />
