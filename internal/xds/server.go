@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"sync"
 
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
@@ -45,6 +46,9 @@ type Server struct {
 	dlpCache    *cachev3.LinearCache
 	mux         *cachev3.MuxCache
 	rec         *metrics.ControlRecorder
+	// subscribed 记录已订阅过的租户(onDeltaRequest 登记);ReconcileAll 据此重读,
+	// 兜底断连期间丢失的 LISTEN/NOTIFY(listen.go 注:NOTIFY 不持久)。sync.Map 并发安全。
+	subscribed sync.Map // map[tenantID]struct{}
 }
 
 // SetMetrics 注入控制面指标记录器(可选;nil 为 no-op)。
@@ -83,6 +87,7 @@ func (s *Server) onDeltaRequest(_ int64, req *discoveryv3.DeltaDiscoveryRequest)
 		if tid == "" {
 			continue
 		}
+		s.subscribed.Store(tid, struct{}{}) // 登记:供 ReconcileAll 断连/周期对账重读
 		switch req.GetTypeUrl() {
 		case policyTypeURL:
 			s.loadTenant(tid)
@@ -118,6 +123,28 @@ func (s *Server) OnFWNotify(tenantID string) { s.loadFW(tenantID) }
 
 // OnDLPNotify 由 DLP 规则变更 LISTEN/NOTIFY 回调:重读该租户 DLP 规则入缓存(独立流下发)。
 func (s *Server) OnDLPNotify(tenantID string) { s.loadDLP(tenantID) }
+
+// ReconcileAll 对所有已订阅租户重读全部 6 类资源入缓存,**兜底断连期间丢失的 LISTEN/NOTIFY**
+// (listen.go 注:NOTIFY 不持久,断连期间通知会丢;xDS server L2 3.5 须重连后/周期全量对账)。
+// 由 cmd 在 LISTEN 重连后(撤销通道,秒级安全)+ 周期 ticker(兜底,默认 30s)调用。
+// 全 6 个 load* 幂等(UpdateResource 覆盖),重复调用安全;无激活 bundle 的租户 loadTenant 自跳过。
+func (s *Server) ReconcileAll() {
+	n := 0
+	s.subscribed.Range(func(k, _ any) bool {
+		tid := k.(string)
+		s.loadTenant(tid)
+		s.loadRevocations(tid)
+		s.loadSWG(tid)
+		s.loadSites(tid)
+		s.loadFW(tid)
+		s.loadDLP(tid)
+		n++
+		return true
+	})
+	if n > 0 {
+		log.Printf("[xds] 全量对账:%d 租户 × 6 资源(兜底丢失的 NOTIFY)", n)
+	}
+}
 
 // loadTenant 读租户激活 bundle 并 UpdateResource(无激活 bundle 则跳过)。
 func (s *Server) loadTenant(tenantID string) {

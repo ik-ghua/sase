@@ -119,11 +119,13 @@ func TestZTNADataPathEndToEnd(t *testing.T) {
 	defer gs.Stop()
 	// LISTEN/NOTIFY:策略 + 撤销变更触发推送(撤销走独立流)
 	cfgDSN := cfg.RWConnString
-	go func() { _ = data.ListenNotify(subCtx, cfgDSN, data.NotifyChannelPolicyBundle, xsrv.OnNotify) }()
-	go func() { _ = data.ListenNotify(subCtx, cfgDSN, data.NotifyChannelRevocation, xsrv.OnRevocationNotify) }()
+	go func() { _ = data.ListenNotify(subCtx, cfgDSN, data.NotifyChannelPolicyBundle, xsrv.OnNotify, nil) }()
+	go func() {
+		_ = data.ListenNotify(subCtx, cfgDSN, data.NotifyChannelRevocation, xsrv.OnRevocationNotify, nil)
+	}()
 
-	go func() { _ = data.ListenNotify(subCtx, cfgDSN, data.NotifyChannelSWG, xsrv.OnSWGNotify) }()
-	go func() { _ = data.ListenNotify(subCtx, cfgDSN, data.NotifyChannelDLP, xsrv.OnDLPNotify) }()
+	go func() { _ = data.ListenNotify(subCtx, cfgDSN, data.NotifyChannelSWG, xsrv.OnSWGNotify, nil) }()
+	go func() { _ = data.ListenNotify(subCtx, cfgDSN, data.NotifyChannelDLP, xsrv.OnDLPNotify, nil) }()
 
 	bundles := pop.NewBundleStore()
 	revoked := pop.NewRevocationStore()

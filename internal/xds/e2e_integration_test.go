@@ -48,7 +48,9 @@ func startXDS(ctx context.Context, t *testing.T, store data.Store) (string, *tls
 	srv.Register(gs)
 	// 接 LISTEN/NOTIFY:租户 bundle 变更触发增量重载(xDS server L2 3.5)
 	if cfg, ok := data.ConfigFromEnv(); ok {
-		go func() { _ = data.ListenNotify(ctx, cfg.RWConnString, data.NotifyChannelPolicyBundle, srv.OnNotify) }()
+		go func() {
+			_ = data.ListenNotify(ctx, cfg.RWConnString, data.NotifyChannelPolicyBundle, srv.OnNotify, nil)
+		}()
 	}
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

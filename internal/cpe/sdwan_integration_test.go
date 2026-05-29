@@ -75,7 +75,9 @@ func TestSDWANSiteMeshEndToEnd(t *testing.T) {
 	xlis, _ := net.Listen("tcp", "127.0.0.1:0")
 	go func() { _ = gs.Serve(xlis) }()
 	defer gs.Stop()
-	go func() { _ = data.ListenNotify(subCtx, cfg.RWConnString, data.NotifyChannelSite, xsrv.OnSiteNotify) }()
+	go func() {
+		_ = data.ListenNotify(subCtx, cfg.RWConnString, data.NotifyChannelSite, xsrv.OnSiteNotify, nil)
+	}()
 	xdsAddr := xlis.Addr().String()
 
 	// CPE_A 订阅 SiteConfig(验证配置下发底座复用)

@@ -30,11 +30,12 @@ const NotifyChannelDLP = "dlp_changed"
 
 // ListenNotify 在专用连接上 LISTEN channel,每条通知回调 onNotify(payload)。连接断开自动重连,
 // 直到 ctx 取消。注:NOTIFY 不持久,断连期间通知会丢 —— 调用方须在(重)连后做一次全量对账
-// (xDS server L2 3.5),本函数只负责实时信号。
-func ListenNotify(ctx context.Context, dsn, channel string, onNotify func(payload string)) error {
+// (xDS server L2 3.5)。**onReconnect(可空)在每次成功 LISTEN 后调一次**(首连 + 每次重连),
+// 调用方据此做全量对账兜底断连期间丢失的通知;本函数仍负责实时信号 onNotify。
+func ListenNotify(ctx context.Context, dsn, channel string, onNotify func(payload string), onReconnect func()) error {
 	for ctx.Err() == nil {
-		if err := listenOnce(ctx, dsn, channel, onNotify); err != nil && ctx.Err() == nil {
-			// 记一行:NOTIFY 通道静默断开运维无感知(断连期间的通知会丢,待周期对账兜底)
+		if err := listenOnce(ctx, dsn, channel, onNotify, onReconnect); err != nil && ctx.Err() == nil {
+			// 记一行:NOTIFY 通道静默断开运维无感知(断连期间的通知会丢,重连后 onReconnect 全量对账兜底)
 			log.Printf("[data] LISTEN %s 断开,1s 后重连: %v", channel, err)
 			time.Sleep(time.Second)
 			continue
@@ -43,7 +44,7 @@ func ListenNotify(ctx context.Context, dsn, channel string, onNotify func(payloa
 	return ctx.Err()
 }
 
-func listenOnce(ctx context.Context, dsn, channel string, onNotify func(string)) error {
+func listenOnce(ctx context.Context, dsn, channel string, onNotify func(string), onReconnect func()) error {
 	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return err
@@ -51,6 +52,10 @@ func listenOnce(ctx context.Context, dsn, channel string, onNotify func(string))
 	defer conn.Close(ctx)
 	if _, err := conn.Exec(ctx, "LISTEN "+pgx.Identifier{channel}.Sanitize()); err != nil {
 		return err
+	}
+	// LISTEN 已就位:此刻起新 NOTIFY 不会再丢。先做一次全量对账,补上「断连~LISTEN 就位」窗口内丢失的通知。
+	if onReconnect != nil {
+		onReconnect()
 	}
 	for {
 		n, err := conn.WaitForNotification(ctx)
