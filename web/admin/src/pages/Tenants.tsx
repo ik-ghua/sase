@@ -33,6 +33,9 @@ import { client } from '@/api/client';
 import type { components } from '@/api/types';
 import { toApiError, ApiError } from '@/lib/api-error';
 import AppError from '@/components/AppError';
+import TenantFWRules from '@/components/TenantFWRules';
+import TenantSWGRules from '@/components/TenantSWGRules';
+import TenantDLPRules from '@/components/TenantDLPRules';
 
 const { Title } = Typography;
 
@@ -609,6 +612,14 @@ export default function Tenants() {
                 ]}
               />
             )}
+
+            {/* Slice64/65:平台运维代租户管理三项安全能力规则(可读写,Slice62 PUT/DELETE 契约)*/}
+            <Divider>防火墙规则(FWaaS)</Divider>
+            <TenantFWRules tenantId={detailTid} />
+            <Divider>安全网关规则(SWG)</Divider>
+            <TenantSWGRules tenantId={detailTid} />
+            <Divider>数据防泄漏规则(CASB-DLP)</Divider>
+            <TenantDLPRules tenantId={detailTid} />
           </>
         )}
       </Drawer>
