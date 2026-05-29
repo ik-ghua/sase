@@ -35,7 +35,16 @@ func newLPMTrie(bits int) *lpmTrie {
 // ip 必须是与本 trie 同族的规范字节(v4=4 字节、v6=16 字节);ones 为掩码位数。
 // 同一前缀重复插入 → 后插入覆盖(确定性:终态只由「当前已登记的站点集合」决定,与登记顺序无关,
 // 因为 Router 每次重建/增删后该前缀至多对应一个站点条目)。
+//
+// 防御(**跳过而非 panic**):key 位宽须 == 本 trie 族位宽(v4 键 4 字节进 32 位 trie、v6 键 16 字节进
+// 128 位 trie),且 ones∈[0, bits]。键长/ones 不符说明上游派发未归一——**防御性跳过该前缀(不插入)**而非
+// panic:本路径在控制面(Register,经 tunhandshake accept goroutine 无 recover),panic 会 crash 整个 PoP
+// 进程(全租户受影响),把一条可疑 CIDR 升级成可用性事故得不偿失。rebuildRoutesLocked 现按 Mask.Size() 的
+// bits 判族,合法 net.ParseCIDR 输出(含 v4-mapped /96-128)恒满足前置;此守仅为纵深防御,正常路径不触发。
 func (t *lpmTrie) insert(ip net.IP, ones int, value *siteEntry) {
+	if len(ip)*8 != t.bits || ones < 0 || ones > t.bits {
+		return // 错族/越界键:跳过(不崩进程);正常派发不会到这
+	}
 	n := t.root
 	for i := 0; i < ones; i++ {
 		b := bitAt(ip, i)
@@ -50,7 +59,13 @@ func (t *lpmTrie) insert(ip net.IP, ones int, value *siteEntry) {
 
 // longestPrefix 返回包含 ip 的最长前缀对应的站点条目;无命中 → nil。
 // 沿 ip 比特逐位下行,记录沿途遇到的最深 hasValue 节点(即最长匹配前缀)。
+//
+// 防御(**返回 nil 而非 panic**):key 位宽须 == 本 trie 族位宽(同 insert)。route() 按目的族 To4()/To16()
+// 分流,正确调用恒满足;错族键返回 nil(无命中)而非 panic——本路径是每包数据面热路径,绝不因键异常 crash。
 func (t *lpmTrie) longestPrefix(ip net.IP) *siteEntry {
+	if len(ip)*8 != t.bits {
+		return nil // 错族键:视为无命中(不崩进程)
+	}
 	n := t.root
 	var best *siteEntry
 	for i := 0; i <= t.bits; i++ {
@@ -69,7 +84,9 @@ func (t *lpmTrie) longestPrefix(ip net.IP) *siteEntry {
 }
 
 // bitAt 取规范 IP 字节序列第 i 位(0=最高位 / 网络序最左位),返回 0 或 1。
-// 调用方保证 i < len(ip)*8。
+// 前置 i < len(ip)*8 由唯一两个调用方(insert/longestPrefix)的入口守保证:二者均校验键位宽 == 族位宽
+// (不符则跳过/返回 nil,不进循环),且循环 i 上界(insert 的 ones / longestPrefix 的 bits)≤ 族位宽,
+// 故进到 bitAt 时 i 永不越界。
 func bitAt(ip net.IP, i int) int {
 	return int(ip[i/8]>>(7-uint(i%8))) & 1
 }

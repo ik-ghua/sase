@@ -130,11 +130,14 @@ func (r *Router) rebuildRoutesLocked(tenant string) {
 	tr := &tenantRoutes{v4: newLPMTrie(32), v6: newLPMTrie(128)}
 	for _, e := range sites {
 		for _, c := range e.cidrs {
-			ones, _ := c.Mask.Size()
-			if ip4 := c.IP.To4(); ip4 != nil {
-				tr.v4.insert(ip4, ones, e) // v4 用 4 字节规范地址 + 0..32 位
+			// **按掩码位宽判族**(非 IP.To4()):Mask.Size() 第二返回 = 掩码总位数,直接 = 族且与下方键长一致。
+			// 修正 v4-mapped 崩溃:`::ffff:10.0.0.0/104` 的 IP.To4() 非 nil(4 字节)但 ones=104(16 字节掩码),
+			// 旧逻辑会把 4 字节键配 104 ones 塞进 v4 trie → 越界。按掩码位宽:104 对应 128 位掩码 → 进 v6 trie(16 字节键)。
+			ones, maskBits := c.Mask.Size()
+			if maskBits == 32 {
+				tr.v4.insert(c.IP.To4(), ones, e) // v4 掩码 → 4 字节规范地址 + 0..32 位
 			} else {
-				tr.v6.insert(c.IP.To16(), ones, e) // v6 用 16 字节规范地址 + 0..128 位
+				tr.v6.insert(c.IP.To16(), ones, e) // v6/v4-mapped 掩码 → 16 字节规范地址 + 0..128 位
 			}
 		}
 	}
