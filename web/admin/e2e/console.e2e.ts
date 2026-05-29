@@ -29,6 +29,12 @@ test('登录 → 租户页 → 详情 Drawer → PoP 写操作(浏览器真跑)'
 
   // 3) 鉴权探活通过 → '/' 重定向到 /dashboard
   await page.waitForURL(/\/dashboard/, { timeout: 15_000 });
+  // Slice 63:落地页看板点亮(聚合租户/PoP/审计真数据)
+  await expect(page.getByRole('heading', { name: '平台运维总览' })).toBeVisible();
+  await expect(page.getByText('租户', { exact: true })).toBeVisible();
+  await expect(page.getByText('PoP 节点', { exact: true })).toBeVisible();
+  await expect(page.getByText(/^active:\s*\d+$/).first()).toBeVisible({ timeout: 10_000 }); // 状态分布渲染
+  await expect(page.getByText('读取').filter({ hasText: '失败' })).toHaveCount(0); // 三卡无错误
   await page.screenshot({ path: 'e2e/shot-02-after-login.png' });
 
   // 4) 租户页:VM PG 真数据(TenantA)

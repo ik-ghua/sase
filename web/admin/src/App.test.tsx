@@ -7,16 +7,25 @@ import { render, screen, waitFor } from '@testing-library/react';
 import { ConfigProvider } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import AdminLayout from './layouts/AdminLayout';
 import Dashboard from './pages/Dashboard';
 import Login from './pages/Login';
 import AuthGuard from './components/AuthGuard';
 import { useAuthStore } from './stores/auth';
 
+// Dashboard(Slice 63)用 useQuery 拉数据;smoke 测试只验布局,mock client 返空避免真 fetch。
+vi.mock('@/api/client', () => ({
+  client: { GET: vi.fn().mockResolvedValue({ data: [], response: { ok: true, status: 200 } }) },
+}));
+
 function renderWith(ui: React.ReactElement, initialEntries: string[] = ['/']) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <ConfigProvider locale={zhCN} theme={{ token: { colorPrimary: '#1677ff' } }}>
-      <MemoryRouter initialEntries={initialEntries}>{ui}</MemoryRouter>
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={initialEntries}>{ui}</MemoryRouter>
+      </QueryClientProvider>
     </ConfigProvider>,
   );
 }
