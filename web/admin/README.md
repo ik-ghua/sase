@@ -35,6 +35,8 @@ pnpm typegen     # 从 ../../api/openapi/admin.yaml 重新生成 src/api/types.t
 ### e2e(Slice 51/52,真浏览器)
 - `e2e/console.e2e.ts`:dev-token 登录 → 租户页(真数据)→ 详情 Drawer → PoP 新建(浏览器真写)。
 - `e2e/prefill.e2e.ts`:编辑表单预填(Pops/Admins 编辑 Modal)—— **真浏览器验 antd `destroyOnHidden` Modal 的 `initialValues` 预填**;jsdom 单测掩盖过此类时序 bug(Slice52)。
+- `e2e/oidc.e2e.ts`:**真 OIDC 端到端**(自托管 dex)—— 浏览器→dex 真登录→callback 种 `sase_session` cookie(Slice54)。需先按 `e2e/dex-config.yaml` 注释部署 dex + 建 idp_config,跑时设 `OIDC_TID`/`OIDC_IDP`。**注**:OIDC 签发的是租户用户会话,admin API authz 只认 Bearer 不读该 cookie,故验的是 OIDC 机制非"登进控制台"。
+- `e2e/dex-config.yaml`:dev-only dex(OIDC IdP)配置 + 部署说明。
 - `e2e/helpers.ts`:共享 `login(page)`。
 
 跑法:

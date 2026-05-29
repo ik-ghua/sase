@@ -1,0 +1,28 @@
+# dev-only:自托管 dex(OIDC IdP)用于 e2e/oidc.e2e.ts 验证真 OIDC 端到端(Slice 54)。
+# **仅开发测试**,所有凭证均为占位测试值(非真实 secret)。生产对接真 IdP(企微/钉钉/飞书/标准 OIDC)。
+#
+# 部署(VM docker,本机无 docker):
+#   scp 本文件到 VM:/home/ikuai/dex-config.yaml
+#   docker run -d --name sase-dex -p 5556:5556 \
+#     -v /home/ikuai/dex-config.yaml:/etc/dex/config.yaml \
+#     ghcr.io/dexidp/dex:v2.41.1 dex serve /etc/dex/config.yaml
+# 测试用户:alice@oidc-test.local / password
+issuer: http://192.168.11.66:5556 # VM IP;后端(Mac)+ 浏览器均经此访问 dex
+storage:
+  type: memory
+web:
+  http: 0.0.0.0:5556
+oauth2:
+  skipApprovalScreen: true # e2e 免同意屏
+staticClients:
+  - id: sase-dex-test
+    name: SASE dev OIDC
+    secret: sase-dex-secret # 占位测试 secret;建 idp_config 时填同值(经 secret 模块 DEK 加密入库)
+    redirectURIs:
+      - http://localhost:5173/api/v1/idp/callback # 经 vite proxy 回后端;= SASE_OIDC_CALLBACK_URL
+enablePasswordDB: true
+staticPasswords:
+  - email: 'alice@oidc-test.local'
+    hash: '$2a$10$vQuuXJjA/72YOJbnfGnJve/l8zBV6FfjscFi0uNpFGS3FfRTI/9Oi' # bcrypt("password")
+    username: 'alice'
+    userID: 'alice-001'
