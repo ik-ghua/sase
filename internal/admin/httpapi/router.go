@@ -27,6 +27,7 @@ import (
 	"github.com/ikuai8/sase/internal/fw"
 	"github.com/ikuai8/sase/internal/identity"
 	"github.com/ikuai8/sase/internal/idp"
+	"github.com/ikuai8/sase/internal/metrics"
 	"github.com/ikuai8/sase/internal/oidc"
 	"github.com/ikuai8/sase/internal/platform"
 	"github.com/ikuai8/sase/internal/platformaudit"
@@ -70,12 +71,18 @@ var AdminRoutePatterns = []string{
 	"DELETE /api/v1/tenants/{tid}/idp/configs/{cid}",
 	"POST /api/v1/tenants/{tid}/swg/rules",
 	"GET /api/v1/tenants/{tid}/swg/rules",
+	"PUT /api/v1/tenants/{tid}/swg/rules/{id}",
+	"DELETE /api/v1/tenants/{tid}/swg/rules/{id}",
 	"POST /api/v1/tenants/{tid}/sites",
 	"GET /api/v1/tenants/{tid}/sites",
 	"POST /api/v1/tenants/{tid}/fw/rules",
 	"GET /api/v1/tenants/{tid}/fw/rules",
+	"PUT /api/v1/tenants/{tid}/fw/rules/{id}",
+	"DELETE /api/v1/tenants/{tid}/fw/rules/{id}",
 	"POST /api/v1/tenants/{tid}/dlp/rules",
 	"GET /api/v1/tenants/{tid}/dlp/rules",
+	"PUT /api/v1/tenants/{tid}/dlp/rules/{id}",
+	"DELETE /api/v1/tenants/{tid}/dlp/rules/{id}",
 	"POST /api/v1/tenants/{tid}/enrollments",
 	"POST /api/v1/tenants/{tid}/devices/revoke",
 	"GET /api/v1/platform/tenants",
@@ -105,7 +112,7 @@ var AdminRoutePatterns = []string{
 
 // Register 装配 Admin API 路由。
 // oidcDeps / popReg / platformAuditSvc / platformRBAC 均可为 nil(测试/无 PLATFORM_RW DSN):对应端点返 503(端点仍在,守住路由清单)。
-func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity.Service, policySvc policy.Service, resourceSvc resource.Service, auditSvc audit.Service, swgSvc swg.Service, siteSvc site.Service, fwSvc fw.Service, dlpSvc dlp.Service, enrollSvc enroll.Service, platformSvc platform.Service, popReg platform.PopRegistry, platformAuditSvc platformaudit.Service, platformRBAC platformrbac.Service, idpSvc idp.Service, oidcDeps *oidc.HandlerDeps, enrollLimiter *ratelimit.Limiter, verifier *cred.Verifier, adminActiveChecker authz.AdminActiveChecker) {
+func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity.Service, policySvc policy.Service, resourceSvc resource.Service, auditSvc audit.Service, swgSvc swg.Service, siteSvc site.Service, fwSvc fw.Service, dlpSvc dlp.Service, enrollSvc enroll.Service, platformSvc platform.Service, popReg platform.PopRegistry, platformAuditSvc platformaudit.Service, platformRBAC platformrbac.Service, idpSvc idp.Service, oidcDeps *oidc.HandlerDeps, enrollLimiter *ratelimit.Limiter, verifier *cred.Verifier, adminActiveChecker authz.AdminActiveChecker, apiRec *metrics.APIRecorder) {
 	// 路由表(pattern → handler);键须与 AdminRoutePatterns 完全一致(下方 assert 守)。
 	handlers := map[string]http.Handler{
 		"POST /api/v1/tenants":                          createTenant(tenantSvc),
@@ -132,12 +139,18 @@ func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity
 		"DELETE /api/v1/tenants/{tid}/idp/configs/{cid}": deleteIDPConfig(idpSvc),
 		"POST /api/v1/tenants/{tid}/swg/rules":           createSWGRule(swgSvc),
 		"GET /api/v1/tenants/{tid}/swg/rules":            listSWGRules(swgSvc),
+		"PUT /api/v1/tenants/{tid}/swg/rules/{id}":       updateSWGRule(swgSvc),
+		"DELETE /api/v1/tenants/{tid}/swg/rules/{id}":    deleteSWGRule(swgSvc),
 		"POST /api/v1/tenants/{tid}/sites":               createSite(siteSvc),
 		"GET /api/v1/tenants/{tid}/sites":                listSites(siteSvc),
 		"POST /api/v1/tenants/{tid}/fw/rules":            createFWRule(fwSvc),
 		"GET /api/v1/tenants/{tid}/fw/rules":             listFWRules(fwSvc),
+		"PUT /api/v1/tenants/{tid}/fw/rules/{id}":        updateFWRule(fwSvc),
+		"DELETE /api/v1/tenants/{tid}/fw/rules/{id}":     deleteFWRule(fwSvc),
 		"POST /api/v1/tenants/{tid}/dlp/rules":           createDLPRule(dlpSvc),
 		"GET /api/v1/tenants/{tid}/dlp/rules":            listDLPRules(dlpSvc),
+		"PUT /api/v1/tenants/{tid}/dlp/rules/{id}":       updateDLPRule(dlpSvc),
+		"DELETE /api/v1/tenants/{tid}/dlp/rules/{id}":    deleteDLPRule(dlpSvc),
 		"POST /api/v1/tenants/{tid}/enrollments":         createEnrollment(enrollSvc),
 		"POST /api/v1/tenants/{tid}/devices/revoke":      revokeDevice(enrollSvc),
 		// 平台跨租户(PC-API-1):全租户列表。authz 默认分支已限 platform_admin;经 platform 模块 InPlatformTx 读策展视图。
@@ -189,7 +202,11 @@ func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity
 			"/api/v1/trust/pubkey": true, // 公开只读
 		},
 	})
-	mux.Handle("/api/v1/", csrfMW(authz.NewGuard(verifier).WithAdminActiveChecker(adminActiveChecker).Middleware(audit.ActorMiddleware(audit.Middleware(auditSvc)(api)))))
+	chain := csrfMW(authz.NewGuard(verifier).WithAdminActiveChecker(adminActiveChecker).Middleware(audit.ActorMiddleware(audit.Middleware(auditSvc)(api))))
+	// 最外层 RED 指标(Slice59→60):route 取内层 api mux 注册的 pattern(低基数模板,非真实路径/不打 tenant);
+	// apiRec=nil 则透传(测试不启用)。
+	routeOf := func(r *http.Request) string { _, pat := api.Handler(r); return pat }
+	mux.Handle("/api/v1/", metrics.HTTPMiddleware(apiRec, routeOf)(chain))
 }
 
 // csrfAllowedOriginsFromEnv 从 SASE_CSRF_ALLOWED_ORIGINS 读逗号分隔列表(scheme://host[:port])。
@@ -813,6 +830,105 @@ func listDLPRules(svc dlp.Service) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, rs)
+	}
+}
+
+// ── 安全规则 PUT(全量替换)/ DELETE(三项能力对称;PUT 复用 Create 校验,DELETE 幂等)──
+// 不存在的 id(含跨租户 RLS 不可见)→ 404;校验失败 → 400;成功 PUT → 200+规则、DELETE → 204。
+
+func updateSWGRule(svc swg.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var rule swg.Rule
+		if !decode(w, r, &rule) {
+			return
+		}
+		err := svc.UpdateRule(r.Context(), r.PathValue("tid"), r.PathValue("id"), &rule)
+		switch {
+		case errors.Is(err, swg.ErrNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case err != nil:
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		default:
+			writeJSON(w, http.StatusOK, rule)
+		}
+	}
+}
+
+func deleteSWGRule(svc swg.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		err := svc.DeleteRule(r.Context(), r.PathValue("tid"), r.PathValue("id"))
+		switch {
+		case errors.Is(err, swg.ErrNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case err != nil:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}
+}
+
+func updateFWRule(svc fw.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var rule fw.Rule
+		if !decode(w, r, &rule) {
+			return
+		}
+		err := svc.UpdateRule(r.Context(), r.PathValue("tid"), r.PathValue("id"), &rule)
+		switch {
+		case errors.Is(err, fw.ErrNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case err != nil:
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		default:
+			writeJSON(w, http.StatusOK, rule)
+		}
+	}
+}
+
+func deleteFWRule(svc fw.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		err := svc.DeleteRule(r.Context(), r.PathValue("tid"), r.PathValue("id"))
+		switch {
+		case errors.Is(err, fw.ErrNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case err != nil:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}
+}
+
+func updateDLPRule(svc dlp.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var rule dlp.Rule
+		if !decode(w, r, &rule) {
+			return
+		}
+		err := svc.UpdateRule(r.Context(), r.PathValue("tid"), r.PathValue("id"), &rule)
+		switch {
+		case errors.Is(err, dlp.ErrNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case err != nil:
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		default:
+			writeJSON(w, http.StatusOK, rule)
+		}
+	}
+}
+
+func deleteDLPRule(svc dlp.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		err := svc.DeleteRule(r.Context(), r.PathValue("tid"), r.PathValue("id"))
+		switch {
+		case errors.Is(err, dlp.ErrNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case err != nil:
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
 	}
 }
 

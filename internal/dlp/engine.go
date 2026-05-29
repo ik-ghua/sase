@@ -27,6 +27,7 @@ const (
 
 // Rule 是一条 DLP 规则。
 type Rule struct {
+	ID        string `json:"id,omitempty"` // authoring/管理标识(PUT/DELETE 寻址用);数据面引擎不读
 	Name      string `json:"name"`
 	MatchType string `json:"match_type"` // keyword | regex
 	Pattern   string `json:"pattern"`

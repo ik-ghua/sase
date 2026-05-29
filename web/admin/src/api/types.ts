@@ -866,6 +866,100 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tenants/{tid}/swg/rules/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 租户 ID(UUID) */
+                tid: components["parameters"]["Tid"];
+                /** @description 规则 ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /** 全量替换 SWG 规则(改规则与建规则同等校验) */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description 租户 ID(UUID) */
+                    tid: components["parameters"]["Tid"];
+                    /** @description 规则 ID */
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["SWGRule"];
+                };
+            };
+            responses: {
+                /** @description 已更新 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["SWGRule"];
+                    };
+                };
+                /** @description 校验失败 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description 规则不存在 */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        post?: never;
+        /** 删除 SWG 规则 */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description 租户 ID(UUID) */
+                    tid: components["parameters"]["Tid"];
+                    /** @description 规则 ID */
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description 已删除 */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description 规则不存在 */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tenants/{tid}/sites": {
         parameters: {
             query?: never;
@@ -1004,6 +1098,100 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/tenants/{tid}/fw/rules/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 租户 ID(UUID) */
+                tid: components["parameters"]["Tid"];
+                /** @description 规则 ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /** 全量替换 FWaaS 规则(改规则与建规则同等校验) */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description 租户 ID(UUID) */
+                    tid: components["parameters"]["Tid"];
+                    /** @description 规则 ID */
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["FWRule"];
+                };
+            };
+            responses: {
+                /** @description 已更新 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["FWRule"];
+                    };
+                };
+                /** @description 校验失败 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description 规则不存在 */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        post?: never;
+        /** 删除 FWaaS 规则 */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description 租户 ID(UUID) */
+                    tid: components["parameters"]["Tid"];
+                    /** @description 规则 ID */
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description 已删除 */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description 规则不存在 */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tenants/{tid}/dlp/rules": {
         parameters: {
             query?: never;
@@ -1068,6 +1256,100 @@ export interface paths {
             };
         };
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/tenants/{tid}/dlp/rules/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 租户 ID(UUID) */
+                tid: components["parameters"]["Tid"];
+                /** @description 规则 ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /** 全量替换 CASB-DLP 规则(改规则与建规则同等校验) */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description 租户 ID(UUID) */
+                    tid: components["parameters"]["Tid"];
+                    /** @description 规则 ID */
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["DLPRule"];
+                };
+            };
+            responses: {
+                /** @description 已更新 */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["DLPRule"];
+                    };
+                };
+                /** @description 校验失败 */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description 规则不存在 */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        post?: never;
+        /** 删除 CASB-DLP 规则 */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description 租户 ID(UUID) */
+                    tid: components["parameters"]["Tid"];
+                    /** @description 规则 ID */
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description 已删除 */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description 规则不存在 */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
         options?: never;
         head?: never;
         patch?: never;
@@ -2293,11 +2575,21 @@ export interface components {
             source?: "api" | "data";
         };
         SWGRule: {
+            /**
+             * Format: uuid
+             * @description 规则 ID(响应含;PUT/DELETE 经路径寻址)
+             */
+            readonly id?: string;
             kind?: string;
             pattern?: string;
             action?: string;
         };
         FWRule: {
+            /**
+             * Format: uuid
+             * @description 规则 ID(响应含;PUT/DELETE 经路径寻址)
+             */
+            readonly id?: string;
             priority?: number;
             /** @enum {string} */
             action?: "allow" | "deny";
@@ -2309,6 +2601,11 @@ export interface components {
             dst_port_max?: number;
         };
         DLPRule: {
+            /**
+             * Format: uuid
+             * @description 规则 ID(响应含;PUT/DELETE 经路径寻址)
+             */
+            readonly id?: string;
             name?: string;
             /** @enum {string} */
             match_type?: "keyword" | "regex";

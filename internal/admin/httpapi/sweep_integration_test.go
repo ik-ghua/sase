@@ -76,7 +76,7 @@ func TestDecommissionSweep(t *testing.T) {
 		nil, // platform audit svc
 		nil, // platform RBAC svc
 		testIDPSvc(t, store, secSvc),
-		nil, nil, verifier, nil,
+		nil, nil, verifier, nil, nil,
 	)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()

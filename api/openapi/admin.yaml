@@ -200,6 +200,25 @@ paths:
       summary: 列出 SWG 规则
       responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/SWGRule' } } } } } }
 
+  /api/v1/tenants/{tid}/swg/rules/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Tid' }
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid }, description: 规则 ID }
+    put:
+      tags: [security-swg]
+      summary: 全量替换 SWG 规则(改规则与建规则同等校验)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SWGRule' } } } }
+      responses:
+        '200': { description: 已更新, content: { application/json: { schema: { $ref: '#/components/schemas/SWGRule' } } } }
+        '400': { description: 校验失败 }
+        '404': { description: 规则不存在 }
+    delete:
+      tags: [security-swg]
+      summary: 删除 SWG 规则
+      responses:
+        '204': { description: 已删除 }
+        '404': { description: 规则不存在 }
+
   /api/v1/tenants/{tid}/sites:
     parameters: [ { $ref: '#/components/parameters/Tid' } ]
     post:
@@ -224,6 +243,25 @@ paths:
       summary: 列出 FWaaS 规则
       responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/FWRule' } } } } } }
 
+  /api/v1/tenants/{tid}/fw/rules/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Tid' }
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid }, description: 规则 ID }
+    put:
+      tags: [security-fw]
+      summary: 全量替换 FWaaS 规则(改规则与建规则同等校验)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/FWRule' } } } }
+      responses:
+        '200': { description: 已更新, content: { application/json: { schema: { $ref: '#/components/schemas/FWRule' } } } }
+        '400': { description: 校验失败 }
+        '404': { description: 规则不存在 }
+    delete:
+      tags: [security-fw]
+      summary: 删除 FWaaS 规则
+      responses:
+        '204': { description: 已删除 }
+        '404': { description: 规则不存在 }
+
   /api/v1/tenants/{tid}/dlp/rules:
     parameters: [ { $ref: '#/components/parameters/Tid' } ]
     post:
@@ -235,6 +273,25 @@ paths:
       tags: [security-dlp]
       summary: 列出 CASB-DLP 规则
       responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/DLPRule' } } } } } }
+
+  /api/v1/tenants/{tid}/dlp/rules/{id}:
+    parameters:
+      - { $ref: '#/components/parameters/Tid' }
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid }, description: 规则 ID }
+    put:
+      tags: [security-dlp]
+      summary: 全量替换 CASB-DLP 规则(改规则与建规则同等校验)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DLPRule' } } } }
+      responses:
+        '200': { description: 已更新, content: { application/json: { schema: { $ref: '#/components/schemas/DLPRule' } } } }
+        '400': { description: 校验失败 }
+        '404': { description: 规则不存在 }
+    delete:
+      tags: [security-dlp]
+      summary: 删除 CASB-DLP 规则
+      responses:
+        '204': { description: 已删除 }
+        '404': { description: 规则不存在 }
 
   /api/v1/tenants/{tid}/enrollments:
     parameters: [ { $ref: '#/components/parameters/Tid' } ]
@@ -686,12 +743,14 @@ components:
     SWGRule:
       type: object
       properties:
+        id:      { type: string, format: uuid, readOnly: true, description: 规则 ID(响应含;PUT/DELETE 经路径寻址) }
         kind:    { type: string }
         pattern: { type: string }
         action:  { type: string }
     FWRule:
       type: object
       properties:
+        id:           { type: string, format: uuid, readOnly: true, description: 规则 ID(响应含;PUT/DELETE 经路径寻址) }
         priority:     { type: integer }
         action:       { type: string, enum: [allow, deny] }
         protocol:     { type: string, enum: [any, tcp, udp, icmp] }
@@ -702,6 +761,7 @@ components:
     DLPRule:
       type: object
       properties:
+        id:         { type: string, format: uuid, readOnly: true, description: 规则 ID(响应含;PUT/DELETE 经路径寻址) }
         name:       { type: string }
         match_type: { type: string, enum: [keyword, regex] }
         pattern:    { type: string }

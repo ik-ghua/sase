@@ -32,6 +32,7 @@ const (
 
 // Rule 是一条 L3/L4 防火墙规则(5 元组匹配)。空 CIDR / 0 端口范围 = any。
 type Rule struct {
+	ID         string `json:"id,omitempty"` // authoring/管理标识(PUT/DELETE 寻址用);数据面引擎不读
 	Priority   int    `json:"priority"`
 	Action     string `json:"action"`   // allow | deny
 	Protocol   string `json:"protocol"` // any | tcp | udp | icmp

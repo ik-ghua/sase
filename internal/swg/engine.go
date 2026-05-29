@@ -16,6 +16,7 @@ const (
 
 // Rule 是一条 SWG 规则(起步仅阻断)。
 type Rule struct {
+	ID      string `json:"id,omitempty"` // authoring/管理标识(PUT/DELETE 寻址用);数据面引擎不读
 	Kind    string `json:"kind"`
 	Pattern string `json:"pattern"`
 	Action  string `json:"action"`

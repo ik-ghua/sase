@@ -34,6 +34,7 @@ import (
 	"github.com/ikuai8/sase/internal/fw"
 	"github.com/ikuai8/sase/internal/identity"
 	"github.com/ikuai8/sase/internal/idp"
+	"github.com/ikuai8/sase/internal/metrics"
 	"github.com/ikuai8/sase/internal/oidc"
 	"github.com/ikuai8/sase/internal/platform"
 	"github.com/ikuai8/sase/internal/platformaudit"
@@ -196,7 +197,12 @@ func run() error {
 			return platformRBACSvc.IsActive(ctx, subject)
 		}
 	}
-	httpapi.Register(app.Mux(), tenantSvc, identitySvc, policySvc, resourceSvc, auditSvc, swgSvc, siteSvc, fwSvc, dlpSvc, enrollSvc, platformSvc, popReg, platformAuditSvc, platformRBACSvc, idpSvc, buildOIDCDeps(idpSvc, identitySvc, auditSvc), enrollLimiter, verifier, adminActiveChecker)
+	// Slice60:管理面 HTTP RED 指标(请求计数 + 时延);独立 registry,/metrics 另端口暴露(下方 goroutine)。
+	apiRec := metrics.NewAPIRecorder()
+	httpapi.Register(app.Mux(), tenantSvc, identitySvc, policySvc, resourceSvc, auditSvc, swgSvc, siteSvc, fwSvc, dlpSvc, enrollSvc, platformSvc, popReg, platformAuditSvc, platformRBACSvc, idpSvc, buildOIDCDeps(idpSvc, identitySvc, auditSvc), enrollLimiter, verifier, adminActiveChecker, apiRec)
+
+	// /metrics 明文内部抓取(与 pop-agent/xds-server 对齐;运维 L2 3.10,客户不可见、数据不出域)。
+	go serveMetrics(ctx, envOr("SASE_API_METRICS_ADDR", ":9100"), apiRec.Handler())
 
 	// Slice36(b) 周期 sweep:env-gated SASE_SWEEP_INTERVAL(time.ParseDuration,如 "10m";空/0 不启)。
 	// 与 HTTP 端点共用 platform.RunDecommissionSweep——单一编排源,无 drift。
@@ -301,6 +307,18 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// serveMetrics 在独立端口暴露 /metrics(明文内部抓取;与 pop-agent/xds-server 对齐)。
+func serveMetrics(ctx context.Context, addr string, h http.Handler) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", h)
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() { <-ctx.Done(); _ = srv.Close() }()
+	log.Printf("[api-server] /metrics 监听 %s", addr)
+	if err := srv.ListenAndServe(); err != nil && ctx.Err() == nil {
+		log.Printf("[api-server] /metrics 退出: %v", err)
+	}
 }
 
 // newSigner 构造凭证签发器。SASE_CRED_ALG 选算法(ed25519 默认 | sm2 国密,crypto-agility R7);

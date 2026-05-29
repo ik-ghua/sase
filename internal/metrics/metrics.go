@@ -7,6 +7,7 @@ package metrics
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -133,4 +134,96 @@ func (r *ControlRecorder) XDSPushValue(resource string) float64 {
 		return 0
 	}
 	return m.GetCounter().GetValue()
+}
+
+// APIRecorder 持管理面(Admin API)HTTP RED 指标(请求计数 + 时延直方图;运维 L2 3.4/3.10,L1 2.2 SLO 前置)。
+// **基数控制**:route 用注册的 mux 路由模板(如 "GET /api/v1/tenants/{tid}/users",27 个,非真实路径)、
+// **不打 tenant**;code 为 HTTP 状态码(有界 ~十几种)。nil 方法 no-op。
+type APIRecorder struct {
+	reg      *prometheus.Registry
+	requests *prometheus.CounterVec
+	duration *prometheus.HistogramVec
+}
+
+// NewAPIRecorder 构造带独立 registry 的管理面 HTTP 指标记录器。
+func NewAPIRecorder() *APIRecorder {
+	reg := prometheus.NewRegistry()
+	requests := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "sase", Subsystem: "api", Name: "requests_total",
+		Help: "管理面 HTTP 请求数(按方法/路由模板/状态码)",
+	}, []string{"method", "route", "code"})
+	duration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "sase", Subsystem: "api", Name: "request_duration_seconds",
+		Help:    "管理面 HTTP 请求时延秒(按方法/路由模板)",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"method", "route"})
+	reg.MustRegister(requests, duration)
+	return &APIRecorder{reg: reg, requests: requests, duration: duration}
+}
+
+// Observe 记一次 HTTP 请求(nil 为 no-op)。route=路由模板(低基数),code=HTTP 状态码,dur=耗时。
+func (r *APIRecorder) Observe(method, route string, code int, dur time.Duration) {
+	if r == nil {
+		return
+	}
+	r.requests.WithLabelValues(method, route, strconv.Itoa(code)).Inc()
+	r.duration.WithLabelValues(method, route).Observe(dur.Seconds())
+}
+
+// Handler 返回 /metrics 处理器。
+func (r *APIRecorder) Handler() http.Handler {
+	return promhttp.HandlerFor(r.reg, promhttp.HandlerOpts{})
+}
+
+// RequestCount 返回某(method,route,code)的计数(测试/自检用)。
+func (r *APIRecorder) RequestCount(method, route string, code int) float64 {
+	c, err := r.requests.GetMetricWithLabelValues(method, route, strconv.Itoa(code))
+	if err != nil {
+		return 0
+	}
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		return 0
+	}
+	return m.GetCounter().GetValue()
+}
+
+// HTTPMiddleware 记录每个 HTTP 请求的 RED 指标(计数 + 时延)。routeOf(r) 返回低基数路由模板
+// (调用方用 mux.Handler(r) 取注册的 pattern;空串→"other")。rec=nil 则透传(不启用)。
+func HTTPMiddleware(rec *APIRecorder, routeOf func(*http.Request) string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		if rec == nil {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			route := "other"
+			if routeOf != nil {
+				if rt := routeOf(r); rt != "" {
+					route = rt
+				}
+			}
+			sw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			start := time.Now()
+			next.ServeHTTP(sw, r)
+			rec.Observe(r.Method, route, sw.status, time.Since(start))
+		})
+	}
+}
+
+// statusRecorder 截获 HTTP 状态码(默认 200);仅记码,不动 body。
+// ⚠️ 仅内嵌 ResponseWriter,不转发 http.Flusher/http.Hijacker——当前 Admin API 全是非流式
+// JSON 端点,无影响;若日后加流式端点(SSE/审计实时推送/WebSocket),须在此补可选接口转发,
+// 否则会静默吞掉 Flush/Hijack。
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (w *statusRecorder) WriteHeader(code int) {
+	if !w.wroteHeader {
+		w.status = code
+		w.wroteHeader = true
+	}
+	w.ResponseWriter.WriteHeader(code)
 }

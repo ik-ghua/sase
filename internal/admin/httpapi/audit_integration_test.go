@@ -69,7 +69,7 @@ func TestAuditTrailEndToEnd(t *testing.T) {
 		testIDPSvc(t, store, secSvc),
 		nil, // oidc deps:本测不走 OIDC
 		nil, // 限流器(测试不限流)
-		verifier, nil,
+		verifier, nil, nil,
 	)
 	srv := httptest.NewServer(mux) // 明文 HTTP 足够(TLS 在 Slice8 单测;authz 是 app 层)
 	defer srv.Close()

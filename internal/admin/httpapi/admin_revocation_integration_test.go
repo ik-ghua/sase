@@ -69,7 +69,7 @@ func TestAdminTokenActiveRevocation(t *testing.T) {
 		enroll.NewService(store, nil),
 		platform.NewService(store), nil, platformaudit.NewService(store), rbacSvc,
 		testIDPSvc(t, store, secSvc),
-		nil, nil, verifier, checker,
+		nil, nil, verifier, checker, nil,
 	)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
