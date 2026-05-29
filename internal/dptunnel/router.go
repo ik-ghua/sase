@@ -14,7 +14,8 @@ import (
 // 即便源地址被伪造成某站点,伪造者无该会话密钥 → `sess.Open` 失败丢弃,不产生跨租户明文转发。
 // 入向解复用(srcAddr→site)dev/非 NAT 可行;NAT 下须用握手协商的 receiver-index(待握手/审查)。
 //
-// 骨架性能限:单 Serve goroutine 串行收发、route 线性全表 LPM——生产需 worker pool/SO_REUSEPORT + radix LPM。
+// 骨架性能限:单 Serve goroutine 串行收发——生产需 worker pool/SO_REUSEPORT。
+// 选路已由线性全表扫描升级为每租户 v4/v6 LPM trie(见 lpm.go),热路径 O(地址位宽)、与站点/CIDR 数无关。
 
 // siteEntry 是 PoP 上一个已接入站点的隧道状态。
 type siteEntry struct {
@@ -40,18 +41,30 @@ type Firewall interface {
 	Allow(tenant string, p Packet5Tuple) bool
 }
 
+// tenantRoutes 持单租户的两族 LPM trie(v4/v6 分开,杜绝跨族 ones 误比)。
+// 由 byTenant[tenant] 的站点 CIDR 派生,在 Register/removeLocked(均持写锁)时重建,保持与 byTenant 一致。
+type tenantRoutes struct {
+	v4 *lpmTrie
+	v6 *lpmTrie
+}
+
 // Router 持各接入站点,做入向解复用 + 按内层目的 IP 的租户内选路 + 可选 FWaaS L3/L4 裁决。
 type Router struct {
 	mu       sync.RWMutex
-	bySrc    map[string]*siteEntry   // udp src addr → 站点(入向解复用)
-	byTenant map[string][]*siteEntry // 租户 → 站点(选路,租户内 LPM)
-	fw       Firewall                // 可选 FWaaS 钩子(SetFirewall 设;须在 Serve 前设,之后只读)
-	onDrop   func(reason string)     // 可选丢包计数钩子(SetDropHook 设;数据面可观测,Slice67)
+	bySrc    map[string]*siteEntry    // udp src addr → 站点(入向解复用)
+	byTenant map[string][]*siteEntry  // 租户 → 站点(站点集合的权威来源;登记/注销在此增删)
+	routes   map[string]*tenantRoutes // 租户 → LPM trie(选路热路径,由 byTenant 派生重建)
+	fw       Firewall                 // 可选 FWaaS 钩子(SetFirewall 设;须在 Serve 前设,之后只读)
+	onDrop   func(reason string)      // 可选丢包计数钩子(SetDropHook 设;数据面可观测,Slice67)
 }
 
 // NewRouter 构造路由器。
 func NewRouter() *Router {
-	return &Router{bySrc: map[string]*siteEntry{}, byTenant: map[string][]*siteEntry{}}
+	return &Router{
+		bySrc:    map[string]*siteEntry{},
+		byTenant: map[string][]*siteEntry{},
+		routes:   map[string]*tenantRoutes{},
+	}
 }
 
 // SetFirewall 挂 FWaaS L3/L4 裁决钩子(每租户网络分段)。同锁写,与 Handle 读取无竞争。
@@ -78,6 +91,7 @@ func (r *Router) Register(tenant, site string, sess *Session, addr net.Addr, cid
 	e := &siteEntry{tenant: tenant, site: site, sess: sess, addr: addr, cidrs: cidrs}
 	r.bySrc[addr.String()] = e
 	r.byTenant[tenant] = append(r.byTenant[tenant], e)
+	r.rebuildRoutesLocked(tenant)
 }
 
 // Deregister 注销一个站点(隧道断开/撤销时调用)。
@@ -87,16 +101,41 @@ func (r *Router) Deregister(tenant, site string) {
 	r.removeLocked(tenant, site)
 }
 
-// removeLocked 移除 (tenant, site) 的现有条目(调用方持写锁)。
+// removeLocked 移除 (tenant, site) 的现有条目并重建该租户 trie(调用方持写锁)。
 func (r *Router) removeLocked(tenant, site string) {
 	sites := r.byTenant[tenant]
 	for i, e := range sites {
 		if e.site == site {
 			delete(r.bySrc, e.addr.String())
 			r.byTenant[tenant] = append(sites[:i], sites[i+1:]...)
+			r.rebuildRoutesLocked(tenant)
 			return
 		}
 	}
+}
+
+// rebuildRoutesLocked 由 byTenant[tenant] 的站点 CIDR 重建该租户的 v4/v6 LPM trie(调用方持写锁)。
+// 重建(O(站点×CIDR))只在登记/注销的控制面路径发生(低频),换取选路热路径 O(地址位宽);
+// 全量重建保证 trie 与 byTenant 一致(终态只由当前站点集合决定,与增删顺序无关,等价原线性扫描)。
+// 站点为空 → 删除该租户的 routes 项(route 取不到即返回 nil,语义同无站点)。
+func (r *Router) rebuildRoutesLocked(tenant string) {
+	sites := r.byTenant[tenant]
+	if len(sites) == 0 {
+		delete(r.routes, tenant)
+		return
+	}
+	tr := &tenantRoutes{v4: newLPMTrie(32), v6: newLPMTrie(128)}
+	for _, e := range sites {
+		for _, c := range e.cidrs {
+			ones, _ := c.Mask.Size()
+			if ip4 := c.IP.To4(); ip4 != nil {
+				tr.v4.insert(ip4, ones, e) // v4 用 4 字节规范地址 + 0..32 位
+			} else {
+				tr.v6.insert(c.IP.To16(), ones, e) // v6 用 16 字节规范地址 + 0..128 位
+			}
+		}
+	}
+	r.routes[tenant] = tr
 }
 
 // Outbound 是一条待 PoP 发出的数据报(转发给目的站点)。
@@ -156,27 +195,19 @@ func (r *Router) Handle(datagram []byte, src net.Addr) []Outbound {
 	return out
 }
 
-// route 在 tenant 路由域内按最长前缀匹配选目的站点。
+// route 在 tenant 路由域内按最长前缀匹配选目的站点(经 LPM trie,O(地址位宽))。
+// 按目的地址族在对应族的 trie 内查询:v4 目的只查 v4 trie、v6 目的只查 v6 trie → 同族比较、不跨族误配。
 func (r *Router) route(tenant string, dst net.IP) *siteEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	dstV4 := dst.To4() != nil
-	var best *siteEntry
-	bestOnes := -1
-	for _, e := range r.byTenant[tenant] {
-		for _, c := range e.cidrs {
-			if (c.IP.To4() != nil) != dstV4 {
-				continue // 只在同地址族内比前缀长度(避免 v4/v6 的 ones 混比)
-			}
-			if c.Contains(dst) {
-				ones, _ := c.Mask.Size()
-				if ones > bestOnes {
-					bestOnes, best = ones, e
-				}
-			}
-		}
+	tr := r.routes[tenant]
+	if tr == nil {
+		return nil // 该租户无站点 → 无路由
 	}
-	return best
+	if ip4 := dst.To4(); ip4 != nil {
+		return tr.v4.longestPrefix(ip4)
+	}
+	return tr.v6.longestPrefix(dst.To16())
 }
 
 // parse5Tuple 从 L3 包提取 5 元组(IPv4/IPv6;dst/src IP 偏移与 IHL/分片无关,可靠)。
