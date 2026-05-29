@@ -63,6 +63,10 @@ describe('Tenants 页', () => {
       if (path === '/api/v1/tenants/{tid}/policies') {
         return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
       }
+      // 风险快照默认 404(无快照)— 各测试用 mockImplementation 覆盖具体行为
+      if (path === '/api/v1/tenants/{tid}/risk/{subject}') {
+        return Promise.resolve({ data: undefined, response: { ok: false, status: 404 } });
+      }
       return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
     });
   });
@@ -256,5 +260,68 @@ describe('Tenants 页', () => {
     // 策略列表:渲染策略行(主体 risk_gte:critical + 效果 deny)
     expect(screen.getByText('risk_gte:critical')).toBeInTheDocument();
     expect(screen.getByText('app-x')).toBeInTheDocument();
+  });
+
+  // ---- Slice68 风险列(懒查)----
+
+  // 通用:渲染含一个用户的 Drawer,path-aware mock,risk 行为由 riskResp 决定
+  function mockWithRisk(riskResp: { data?: unknown; response: { ok: boolean; status: number } }) {
+    mockGET.mockImplementation((path: string) => {
+      if (path === '/api/v1/tenants/{tid}/users') {
+        return Promise.resolve({
+          data: [{ id: 'u1', external_id: 'ext-1', email: 'alice@t.io', status: 'active' }],
+          response: { ok: true, status: 200 },
+        });
+      }
+      if (path === '/api/v1/tenants/{tid}/policies/bundle') {
+        return Promise.resolve({ data: null, response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/policies') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/risk/{subject}') {
+        return Promise.resolve(riskResp);
+      }
+      return Promise.resolve({ data: [activeTenant], response: { ok: true, status: 200 } });
+    });
+  }
+
+  it('风险列:点「查看风险」→ 懒查 → 显 level Tag + score', async () => {
+    mockWithRisk({
+      data: { subject: 'ext-1', score: 88, level: 'critical' },
+      response: { ok: true, status: 200 },
+    });
+    renderWith();
+    await waitFor(() => expect(screen.getByText('TenantA')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /详情/ }));
+    // 用户行渲染后,风险列默认显示「查看风险」懒查按钮(此时尚未发起 risk 查询)
+    await waitFor(() => expect(screen.getByText('alice@t.io')).toBeInTheDocument());
+    const viewBtn = screen.getByRole('button', { name: /查看风险/ });
+    expect(viewBtn).toBeInTheDocument();
+    // 懒查前没发起 risk 请求
+    expect(mockGET).not.toHaveBeenCalledWith(
+      '/api/v1/tenants/{tid}/risk/{subject}',
+      expect.anything(),
+    );
+    fireEvent.click(viewBtn);
+    // 点击后发起查询,经 path tid + subject=external_id 寻址
+    await waitFor(() =>
+      expect(mockGET).toHaveBeenCalledWith('/api/v1/tenants/{tid}/risk/{subject}', {
+        params: { path: { tid: activeTenant.id, subject: 'ext-1' } },
+      }),
+    );
+    // 成功 → 显 level Tag + score
+    await waitFor(() => expect(screen.getByText('critical')).toBeInTheDocument());
+    expect(screen.getByText('88')).toBeInTheDocument();
+  });
+
+  it('风险列:404(无快照)→ 显「未评估」', async () => {
+    mockWithRisk({ data: undefined, response: { ok: false, status: 404 } });
+    renderWith();
+    await waitFor(() => expect(screen.getByText('TenantA')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /详情/ }));
+    await waitFor(() => expect(screen.getByText('alice@t.io')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /查看风险/ }));
+    await waitFor(() => expect(screen.getByText('未评估')).toBeInTheDocument());
   });
 });

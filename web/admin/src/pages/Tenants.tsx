@@ -45,6 +45,15 @@ type TenantPatch = components['schemas']['TenantPatch'];
 type User = components['schemas']['User'];
 type CompileResult = components['schemas']['CompileResult'];
 type Policy = components['schemas']['Policy'];
+type RiskScore = components['schemas']['RiskScore'];
+
+// risk level → Tag 颜色映射(与 status Tag 风格一致:low 绿 / medium 橙 / high·critical 红)
+const RISK_LEVEL_COLORS: Record<string, string> = {
+  low: 'success',
+  medium: 'warning',
+  high: 'error',
+  critical: 'error',
+};
 
 // status → Tag 颜色映射(与后端枚举对齐:Slice 33b/c)
 const STATUS_COLORS: Record<string, string> = {
@@ -130,6 +139,17 @@ async function fetchTenantPolicies(tid: string): Promise<Policy[]> {
   return data ?? [];
 }
 
+// Slice68:某主体最新风险快照(score/level)。subject = 用户 external_id。
+// 404 = 该主体无快照(尚未评估)→ 返 null;503 = 快照持久化未启用 → 抛 ApiError(UI 显可读提示)。
+async function fetchUserRisk(tid: string, subject: string): Promise<RiskScore | null> {
+  const { data, error, response } = await client.GET('/api/v1/tenants/{tid}/risk/{subject}', {
+    params: { path: { tid, subject } },
+  });
+  if (response.status === 404) return null;
+  if (error || !response.ok) throw toApiError(response, error);
+  return (data as RiskScore) ?? null;
+}
+
 function formatDate(s?: string | null): string {
   if (!s) return '-';
   try {
@@ -175,6 +195,58 @@ function buildPatch(orig: TenantSummary, v: TenantPatch): TenantPatch {
     if (typeof nv === 'number' && nv !== orig[k]) p[k] = nv;
   }
   return p;
+}
+
+// Slice68:用户行「风险」列——懒查(点击才发请求),避免 Drawer 打开时对全部用户并发轰炸。
+// 每行独立 useQuery(queryKey 含 subject),enabled 由本地 asked 控制;点击后显 level Tag + score。
+function RiskCell({ tid, subject }: { tid: string; subject: string }) {
+  const [asked, setAsked] = useState(false);
+  const riskQuery = useQuery({
+    queryKey: ['user-risk', tid, subject],
+    queryFn: () => fetchUserRisk(tid, subject),
+    enabled: asked && tid !== '' && subject !== '',
+  });
+
+  // 缺 external_id(subject 空)→ 无法寻址,不提供查询入口。
+  if (!subject) return <Typography.Text type="secondary">-</Typography.Text>;
+
+  if (!asked) {
+    return (
+      <Button size="small" type="link" style={{ padding: 0 }} onClick={() => setAsked(true)}>
+        查看风险
+      </Button>
+    );
+  }
+
+  if (riskQuery.isFetching) return <Typography.Text type="secondary">查询中…</Typography.Text>;
+
+  if (riskQuery.isError) {
+    // 503(快照持久化未启用)或其它错:可读提示 + 允许重试。
+    const msg =
+      riskQuery.error instanceof ApiError && riskQuery.error.status === 503
+        ? '风险快照未启用'
+        : '查询失败';
+    return (
+      <Tooltip title={riskQuery.error instanceof Error ? riskQuery.error.message : undefined}>
+        <Button size="small" type="link" danger style={{ padding: 0 }} onClick={() => riskQuery.refetch()}>
+          {msg}(重试)
+        </Button>
+      </Tooltip>
+    );
+  }
+
+  const rs = riskQuery.data;
+  if (!rs) return <Typography.Text type="secondary">未评估</Typography.Text>;
+
+  const level = rs.level ?? '';
+  return (
+    <Space size={4}>
+      <Tag color={RISK_LEVEL_COLORS[level] ?? 'default'}>{level || 'unknown'}</Tag>
+      {typeof rs.score === 'number' && (
+        <Typography.Text style={{ fontFamily: 'var(--font-mono)' }}>{rs.score}</Typography.Text>
+      )}
+    </Space>
+  );
 }
 
 // 行展示列(纯函数,模块级);操作列在组件内拼接(需要 handler)。
@@ -557,6 +629,14 @@ export default function Tenants() {
                     render: (s?: string) => (
                       <Tag color={s === 'active' ? 'success' : 'default'}>{s ?? '-'}</Tag>
                     ),
+                  },
+                  {
+                    // Slice68:懒查风险(点「查看风险」才发 GET /risk/{external_id});
+                    // 不在 Drawer 打开时对全部用户并发查,避免请求轰炸。
+                    title: '风险',
+                    key: 'risk',
+                    width: 130,
+                    render: (_, u) => <RiskCell tid={detailTid} subject={u.external_id ?? ''} />,
                   },
                 ]}
               />
