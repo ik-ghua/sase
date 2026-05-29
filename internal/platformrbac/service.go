@@ -27,7 +27,38 @@ var (
 	ErrAdminNotFound      = errors.New("platformrbac: 管理员不存在")
 	ErrAdminAlreadyExists = errors.New("platformrbac: subject 已存在")
 	ErrInvalidAdminPatch  = errors.New("platformrbac: 请求字段非法")
+	// ErrLastActiveAdmin:停用/删除会使 active 平台管理员归零(锁死)→ 拒。
+	// 与 handler 的自禁/自删保护互补:自保护防"误操作自己",本保护防"表内最后一枚 active 被任何人(含 bootstrap)停用/删"。
+	ErrLastActiveAdmin = errors.New("platformrbac: 不能停用/删除最后一枚 active 平台管理员")
 )
+
+// guardLastActive 在写事务内锁定所有 active 行(`FOR UPDATE` 序列化并发停用/删除,防 TOCTOU:
+// 否则并发停用两枚不同 active 各见 count=2 均放行 → 归零),若 targetID 当前 active 且为最后一枚 → ErrLastActiveAdmin。
+// 须紧邻 DELETE/UPDATE 前调用,且在同一 q(同事务)。注:count(*) 不能 FOR UPDATE,故取 active id 集合在 Go 侧计数。
+func guardLastActive(ctx context.Context, q data.Queries, targetID string) error {
+	rows, err := q.Query(ctx, `SELECT id FROM platform_admins WHERE status='active' FOR UPDATE`)
+	if err != nil {
+		return fmt.Errorf("platformrbac.guardLastActive: %w", err)
+	}
+	active := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if e := rows.Scan(&id); e != nil {
+			rows.Close()
+			return e
+		}
+		active[id] = true
+	}
+	if e := rows.Err(); e != nil {
+		rows.Close()
+		return e
+	}
+	rows.Close() // 必须在后续 q.Exec/QueryRow 前关闭(同事务单连接)
+	if active[targetID] && len(active) <= 1 {
+		return ErrLastActiveAdmin
+	}
+	return nil
+}
 
 // Admin 是 platform_admin 持久化模型。
 type Admin struct {
@@ -199,6 +230,12 @@ func (s *service) Update(ctx context.Context, id string, patch Patch) (*Admin, e
 		strings.Join(sets, ", "), len(args), adminColumns)
 	var a Admin
 	err := s.store.InPlatformTxRW(ctx, func(q data.Queries) error {
+		// last-admin 保护:停用(status→disabled)前若目标是最后一枚 active → 拒(防锁死)。
+		if patch.Status != nil && *patch.Status == "disabled" {
+			if e := guardLastActive(ctx, q, id); e != nil {
+				return e
+			}
+		}
 		row := q.QueryRow(ctx, sqlText, args...)
 		if e := scanAdmin(row, &a); e != nil {
 			if errors.Is(e, data.ErrNoRows) {
@@ -219,6 +256,10 @@ func (s *service) Delete(ctx context.Context, id string) error {
 		return errors.New("platformrbac.Delete: id 必填")
 	}
 	return s.store.InPlatformTxRW(ctx, func(q data.Queries) error {
+		// last-admin 保护:删除最后一枚 active 管理员 → 拒(防锁死)。删 disabled 的不受限。
+		if e := guardLastActive(ctx, q, id); e != nil {
+			return e
+		}
 		ct, err := q.Exec(ctx, `DELETE FROM platform_admins WHERE id=$1`, id)
 		if err != nil {
 			return fmt.Errorf("platformrbac.Delete: %w", err)

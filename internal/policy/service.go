@@ -49,6 +49,8 @@ type Service interface {
 	Compile(ctx context.Context, tenantID string) (CompileResult, error)
 	// ActiveBundle 读该租户当前激活的编译产物(供 xds-server 下发)。
 	ActiveBundle(ctx context.Context, tenantID string) (*xdsv1.PolicyBundle, error)
+	// ListByTenant 列出该租户编写态策略(RLS 内,按 priority,id;Slice57/58 平台运维查看)。
+	ListByTenant(ctx context.Context, tenantID string) ([]Policy, error)
 }
 
 type service struct {
@@ -88,6 +90,25 @@ func (s *service) CreatePolicy(ctx context.Context, tenantID string, p *Policy) 
 		}
 		return nil
 	})
+}
+
+func (s *service) ListByTenant(ctx context.Context, tenantID string) ([]Policy, error) {
+	out := []Policy{}
+	err := s.store.InTxRO(ctx, tenantID, func(q data.Queries) error {
+		ps, e := loadPolicies(ctx, q) // RLS 内读本租户策略(按 priority,id)
+		if e != nil {
+			return e
+		}
+		out = ps
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []Policy{}
+	}
+	return out, nil
 }
 
 func (s *service) Compile(ctx context.Context, tenantID string) (CompileResult, error) {

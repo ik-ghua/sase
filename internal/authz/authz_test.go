@@ -1,6 +1,8 @@
 package authz
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -98,5 +100,56 @@ func TestMiddlewareAuthN(t *testing.T) {
 	}
 	if c := do("", "GET", "/api/v1/trust/pubkey"); c != http.StatusOK {
 		t.Errorf("公开端点应免鉴权 200,得 %d", c)
+	}
+}
+
+// TestMiddlewareAdminActiveChecker(Slice55 主动撤销):platform_admin 令牌每请求复查 active;
+// 撤销→401、checker 错→fail-closed 503、tenant_admin 不受影响、nil checker 向后兼容。
+func TestMiddlewareAdminActiveChecker(t *testing.T) {
+	signer, err := cred.GenerateSigner()
+	if err != nil {
+		t.Fatalf("signer: %v", err)
+	}
+	v, err := cred.NewVerifier(signer.Public())
+	if err != nil {
+		t.Fatalf("verifier: %v", err)
+	}
+	active := map[string]bool{"ok-admin": true} // "gone-admin" 不在 → 已撤销
+	checker := func(_ context.Context, subject string) (bool, error) {
+		if subject == "err-admin" {
+			return false, errors.New("db down")
+		}
+		return active[subject], nil
+	}
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mkTok := func(sub, role, tid string) string {
+		tok, _ := signer.Issue(cred.Claims{Subject: sub, Role: role, TenantID: tid}, time.Hour, time.Now())
+		return tok
+	}
+	doWith := func(g *Guard, tok, method, path string) int {
+		r := httptest.NewRequest(method, path, nil)
+		r.Header.Set("Authorization", "Bearer "+tok)
+		w := httptest.NewRecorder()
+		g.Middleware(next).ServeHTTP(w, r)
+		return w.Code
+	}
+
+	g := NewGuard(v).WithAdminActiveChecker(checker)
+	if c := doWith(g, mkTok("ok-admin", RolePlatformAdmin, ""), "GET", "/api/v1/platform/tenants"); c != http.StatusOK {
+		t.Errorf("active platform_admin 应 200,得 %d", c)
+	}
+	if c := doWith(g, mkTok("gone-admin", RolePlatformAdmin, ""), "GET", "/api/v1/platform/tenants"); c != http.StatusUnauthorized {
+		t.Errorf("已撤销 platform_admin 应 401,得 %d", c)
+	}
+	if c := doWith(g, mkTok("err-admin", RolePlatformAdmin, ""), "GET", "/api/v1/platform/tenants"); c != http.StatusServiceUnavailable {
+		t.Errorf("checker 错应 fail-closed 503,得 %d", c)
+	}
+	// tenant_admin 不在该表,按角色门控不调用 checker → 不受影响(其 subject 不在 active 集也 200)
+	if c := doWith(g, mkTok("any-ta", RoleTenantAdmin, "A"), "GET", "/api/v1/tenants/A/users"); c != http.StatusOK {
+		t.Errorf("tenant_admin 不应被 platform checker 影响,应 200,得 %d", c)
+	}
+	// nil checker:向后兼容,撤销逻辑不生效 → gone-admin 也 200
+	if c := doWith(NewGuard(v), mkTok("gone-admin", RolePlatformAdmin, ""), "GET", "/api/v1/platform/tenants"); c != http.StatusOK {
+		t.Errorf("nil checker 向后兼容应 200,得 %d", c)
 	}
 }

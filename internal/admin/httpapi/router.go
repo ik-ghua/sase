@@ -57,6 +57,7 @@ var AdminRoutePatterns = []string{
 	"POST /api/v1/tenants/{tid}/connectors",
 	"GET /api/v1/tenants/{tid}/connectors",
 	"POST /api/v1/tenants/{tid}/policies",
+	"GET /api/v1/tenants/{tid}/policies",
 	"POST /api/v1/tenants/{tid}/policies/compile",
 	"GET /api/v1/tenants/{tid}/policies/bundle",
 	"POST /api/v1/tenants/{tid}/credentials",
@@ -104,7 +105,7 @@ var AdminRoutePatterns = []string{
 
 // Register 装配 Admin API 路由。
 // oidcDeps / popReg / platformAuditSvc / platformRBAC 均可为 nil(测试/无 PLATFORM_RW DSN):对应端点返 503(端点仍在,守住路由清单)。
-func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity.Service, policySvc policy.Service, resourceSvc resource.Service, auditSvc audit.Service, swgSvc swg.Service, siteSvc site.Service, fwSvc fw.Service, dlpSvc dlp.Service, enrollSvc enroll.Service, platformSvc platform.Service, popReg platform.PopRegistry, platformAuditSvc platformaudit.Service, platformRBAC platformrbac.Service, idpSvc idp.Service, oidcDeps *oidc.HandlerDeps, enrollLimiter *ratelimit.Limiter, verifier *cred.Verifier) {
+func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity.Service, policySvc policy.Service, resourceSvc resource.Service, auditSvc audit.Service, swgSvc swg.Service, siteSvc site.Service, fwSvc fw.Service, dlpSvc dlp.Service, enrollSvc enroll.Service, platformSvc platform.Service, popReg platform.PopRegistry, platformAuditSvc platformaudit.Service, platformRBAC platformrbac.Service, idpSvc idp.Service, oidcDeps *oidc.HandlerDeps, enrollLimiter *ratelimit.Limiter, verifier *cred.Verifier, adminActiveChecker authz.AdminActiveChecker) {
 	// 路由表(pattern → handler);键须与 AdminRoutePatterns 完全一致(下方 assert 守)。
 	handlers := map[string]http.Handler{
 		"POST /api/v1/tenants":                          createTenant(tenantSvc),
@@ -117,6 +118,7 @@ func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity
 		"POST /api/v1/tenants/{tid}/connectors":         createConnector(resourceSvc),
 		"GET /api/v1/tenants/{tid}/connectors":          listConnectors(resourceSvc),
 		"POST /api/v1/tenants/{tid}/policies":           createPolicy(policySvc),
+		"GET /api/v1/tenants/{tid}/policies":            listPolicies(policySvc),
 		"POST /api/v1/tenants/{tid}/policies/compile":   compilePolicies(policySvc),
 		"GET /api/v1/tenants/{tid}/policies/bundle":     getActiveBundle(policySvc),
 		"POST /api/v1/tenants/{tid}/credentials":        issueCredential(identitySvc),
@@ -187,7 +189,7 @@ func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity
 			"/api/v1/trust/pubkey": true, // 公开只读
 		},
 	})
-	mux.Handle("/api/v1/", csrfMW(authz.NewGuard(verifier).Middleware(audit.ActorMiddleware(audit.Middleware(auditSvc)(api)))))
+	mux.Handle("/api/v1/", csrfMW(authz.NewGuard(verifier).WithAdminActiveChecker(adminActiveChecker).Middleware(audit.ActorMiddleware(audit.Middleware(auditSvc)(api)))))
 }
 
 // csrfAllowedOriginsFromEnv 从 SASE_CSRF_ALLOWED_ORIGINS 读逗号分隔列表(scheme://host[:port])。
@@ -597,6 +599,20 @@ func createPolicy(svc policy.Service) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusCreated, p)
+	}
+}
+
+// listPolicies 列出该租户编写态策略(Slice58)。handler 用 path tid 做 RLS 上下文,
+// 故 platform_admin(TenantID 空)可读任意租户;authz 已守作用域。
+func listPolicies(svc policy.Service) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ps, err := svc.ListByTenant(r.Context(), r.PathValue("tid"))
+		if err != nil {
+			log.Printf("[admin] listPolicies tid=%s failed: %v", r.PathValue("tid"), err)
+			http.Error(w, "list policies failed", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, ps)
 	}
 }
 
@@ -1178,7 +1194,7 @@ func listPlatformAudit(svc platformaudit.Service) http.HandlerFunc {
 // platformRBAC nil → 503;双层审计(触发器自动 + handler 显式)同 Slice39 PoP 模式。
 //
 // **删除自己防锁死**:DELETE 不允许 subject == 当前调用方 Principal.Subject(否则可能锁死最后一枚 admin)。
-// 注:Slice38c 不实现"最后一枚 active admin 强制保留"(交运维风险;status=disabled 仍可手动恢复)。
+// 注:"最后一枚 active admin 强制保留"由 service 层 guardLastActive 事务内强制(Slice55),删/禁最后一枚 active → ErrLastActiveAdmin(400)。
 
 func platformRBACNotConfigured(w http.ResponseWriter) {
 	log.Printf("[platform] RBAC 端点 503: SASE_DB_PLATFORM_RW_DSN 未设")
@@ -1277,7 +1293,7 @@ func updatePlatformAdmin(svc platformrbac.Service, auditSvc platformaudit.Servic
 			return
 		}
 		// **B5 防自助锁死**:patch.Status=disabled 时若目标=自己 → 400(用其他 admin 操作或 last-admin disable 等更复杂场景留运维)。
-		// 不能完全防"最后一枚 active admin 被他人 disable",但能消除"误操作 disable 自己即时锁死"的常见手滑。
+		// 自禁防"误操作自己";"最后一枚 active 被他人/bootstrap disable"由 service guardLastActive 事务内兜底(Slice55)。
 		if patch.Status != nil && *patch.Status == "disabled" {
 			if p, ok := authz.FromContext(r.Context()); ok {
 				if target, gerr := svc.Get(r.Context(), aid); gerr == nil && target.Subject == p.Subject {
@@ -1295,6 +1311,9 @@ func updatePlatformAdmin(svc platformrbac.Service, auditSvc platformaudit.Servic
 				code = http.StatusNotFound
 				http.Error(w, err.Error(), code)
 			case errors.Is(err, platformrbac.ErrInvalidAdminPatch):
+				code = http.StatusBadRequest
+				http.Error(w, err.Error(), code)
+			case errors.Is(err, platformrbac.ErrLastActiveAdmin):
 				code = http.StatusBadRequest
 				http.Error(w, err.Error(), code)
 			default:
@@ -1349,6 +1368,9 @@ func deletePlatformAdmin(svc platformrbac.Service, auditSvc platformaudit.Servic
 			switch {
 			case errors.Is(err, platformrbac.ErrAdminNotFound):
 				code = http.StatusNotFound
+				http.Error(w, err.Error(), code)
+			case errors.Is(err, platformrbac.ErrLastActiveAdmin):
+				code = http.StatusBadRequest
 				http.Error(w, err.Error(), code)
 			default:
 				code = http.StatusInternalServerError

@@ -121,7 +121,8 @@ func run() error {
 	// 设 SASE_BOOTSTRAP_PLATFORM_ADMIN=<subject> 则启动时带外签发一枚**短期**(15min)platform_admin 令牌并打印日志,
 	// 操作员**立即**取用、凭它建租户/签发常规 admin。⚠️ 令牌进日志:引导期勿开远端日志采集;**取用后立即清除该 env**,
 	// 否则**每次重启都会再签发一枚 15min 有效令牌**(本机制非真·一次性,无落库/无去重)。
-	if bootSub := os.Getenv("SASE_BOOTSTRAP_PLATFORM_ADMIN"); bootSub != "" {
+	bootSub := os.Getenv("SASE_BOOTSTRAP_PLATFORM_ADMIN") // 捕获供下方主动撤销 checker 豁免 bootstrap 用
+	if bootSub != "" {
 		if tok, berr := identitySvc.IssueAdminToken(ctx, bootSub, authz.RolePlatformAdmin, "", bootstrapAdminTTL); berr != nil {
 			log.Printf("[api-server] 引导 platform_admin 失败: %v", berr)
 		} else {
@@ -184,7 +185,18 @@ func run() error {
 			}
 		}
 	}
-	httpapi.Register(app.Mux(), tenantSvc, identitySvc, policySvc, resourceSvc, auditSvc, swgSvc, siteSvc, fwSvc, dlpSvc, enrollSvc, platformSvc, popReg, platformAuditSvc, platformRBACSvc, idpSvc, buildOIDCDeps(idpSvc, identitySvc, auditSvc), enrollLimiter, verifier)
+	// 主动撤销 checker(Slice55):platform_admin 令牌每请求复查 subject 仍 active(disable/delete 即时失效);
+	// **bootstrap subject 豁免**(不在表,应急通道,否则其令牌连"登记自己"都会被拒)。RBAC 未配则 nil(不启用)。
+	var adminActiveChecker authz.AdminActiveChecker
+	if platformRBACSvc != nil {
+		adminActiveChecker = func(ctx context.Context, subject string) (bool, error) {
+			if bootSub != "" && subject == bootSub {
+				return true, nil
+			}
+			return platformRBACSvc.IsActive(ctx, subject)
+		}
+	}
+	httpapi.Register(app.Mux(), tenantSvc, identitySvc, policySvc, resourceSvc, auditSvc, swgSvc, siteSvc, fwSvc, dlpSvc, enrollSvc, platformSvc, popReg, platformAuditSvc, platformRBACSvc, idpSvc, buildOIDCDeps(idpSvc, identitySvc, auditSvc), enrollLimiter, verifier, adminActiveChecker)
 
 	// Slice36(b) 周期 sweep:env-gated SASE_SWEEP_INTERVAL(time.ParseDuration,如 "10m";空/0 不启)。
 	// 与 HTTP 端点共用 platform.RunDecommissionSweep——单一编排源,无 drift。

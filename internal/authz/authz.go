@@ -39,15 +39,29 @@ func FromContext(ctx context.Context) (Principal, bool) {
 	return p, ok
 }
 
+// AdminActiveChecker 判定 platform_admin subject 是否仍有效(在 platform_admins 表且 active)。
+// 用于 admin 令牌**主动撤销**(Slice55):管理员被 disable/delete 后,其已签出令牌每请求复查 → 即时失效。
+// 返回 (false, nil) → 撤销;(_, err) → 无法判定(fail-closed,拒)。bootstrap 应急通道由实现侧豁免(不在表)。
+// **仅对 platform_admin 令牌调用**(tenant_admin/auditor 不在该表,Middleware 按角色门控不调用)。
+type AdminActiveChecker func(ctx context.Context, subject string) (bool, error)
+
 // Guard 用签发公钥校验 admin 令牌并做授权。
 type Guard struct {
-	verifier *cred.Verifier
-	now      func() time.Time
+	verifier    *cred.Verifier
+	now         func() time.Time
+	adminActive AdminActiveChecker // 可选;nil = 不启用主动撤销(向后兼容)
 }
 
 // NewGuard 构造。
 func NewGuard(verifier *cred.Verifier) *Guard {
 	return &Guard{verifier: verifier, now: time.Now}
+}
+
+// WithAdminActiveChecker 注入 platform_admin 主动撤销校验(per-request 复查 subject 仍 active)。
+// nil 则不启用。返回 g 便于链式。
+func (g *Guard) WithAdminActiveChecker(c AdminActiveChecker) *Guard {
+	g.adminActive = c
+	return g
 }
 
 var adminRoles = map[string]bool{RolePlatformAdmin: true, RoleTenantAdmin: true, RoleAuditor: true}
@@ -85,6 +99,19 @@ func (g *Guard) Middleware(next http.Handler) http.Handler {
 		if err != nil {
 			http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
 			return
+		}
+		// 主动撤销(Slice55):platform_admin 令牌每请求复查 subject 仍 active(disable/delete 即时失效)。
+		// bootstrap 应急通道由 checker 实现侧豁免(不在表);DB 错 → fail-closed(503,不放行)。
+		if p.Role == RolePlatformAdmin && g.adminActive != nil {
+			active, cerr := g.adminActive(r.Context(), p.Subject)
+			if cerr != nil {
+				http.Error(w, "service unavailable: 无法校验管理员状态", http.StatusServiceUnavailable)
+				return
+			}
+			if !active {
+				http.Error(w, "unauthorized: 平台管理员已停用或删除,令牌失效", http.StatusUnauthorized)
+				return
+			}
 		}
 		if !authorize(p, r.Method, r.URL.Path) {
 			http.Error(w, "forbidden", http.StatusForbidden)
