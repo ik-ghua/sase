@@ -1,6 +1,6 @@
 // Slice 47:平台审计页(只读)。GET /platform/audit?limit=N;双层审计 source=api(handler)/data(DB 触发器)。
 import { useState } from 'react';
-import { Card, Table, Tag, Button, Space, Typography, Tooltip, Select } from 'antd';
+import { Card, Table, Tag, Button, Space, Typography, Tooltip, Select, Descriptions } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import { useQuery } from '@tanstack/react-query';
 import type { ColumnsType } from 'antd/es/table';
@@ -12,6 +12,27 @@ import AppError from '@/components/AppError';
 const { Title } = Typography;
 
 type AuditEntry = components['schemas']['PlatformAuditEntry'];
+
+// result 筛选分桶:触发器哨兵(source=data 且 result=0)单列一桶,其余按 HTTP 码段。
+// 哨兵的 result 数值 0 不是 HTTP 码,故不能并入「其它/0」HTTP 桶,须按 source 区分。
+type ResultBucket = 'trigger' | '2xx' | '4xx' | '5xx' | 'other';
+
+function resultBucket(record: AuditEntry): ResultBucket {
+  if (record.source === 'data' && record.result === 0) return 'trigger';
+  const r = record.result;
+  if (r >= 200 && r < 300) return '2xx';
+  if (r >= 400 && r < 500) return '4xx';
+  if (r >= 500) return '5xx';
+  return 'other';
+}
+
+const RESULT_FILTERS = [
+  { text: '触发器(source=data)', value: 'trigger' },
+  { text: '2xx 成功', value: '2xx' },
+  { text: '4xx 客户端错误', value: '4xx' },
+  { text: '5xx 服务端错误', value: '5xx' },
+  { text: '其它', value: 'other' },
+];
 
 const LIMIT_OPTIONS = [
   { value: 50, label: '最近 50 条' },
@@ -81,7 +102,10 @@ const columns: ColumnsType<AuditEntry> = [
     title: '结果',
     dataIndex: 'result',
     key: 'result',
-    width: 90,
+    width: 110,
+    filters: RESULT_FILTERS,
+    // 按 result 维度筛选:触发器哨兵(source=data+result=0)与 HTTP 码段分桶,正确区分双层语义。
+    onFilter: (value, record) => resultBucket(record) === value,
     render: (result: number, record) => renderResult(result, record.source),
   },
   {
@@ -155,6 +179,26 @@ export default function Audit() {
         pagination={{ pageSize: 20, showSizeChanger: true, showTotal: (n) => `共 ${n} 条` }}
         scroll={{ x: 1200 }}
         size="middle"
+        expandable={{
+          // 展开行显示完整 detail(详情列截断,展开看全)+ 主体/角色/动作/关联租户 概览。
+          expandedRowRender: (record) => (
+            <Descriptions size="small" column={1} bordered>
+              <Descriptions.Item label="主体">{record.actor_subject || '-'}</Descriptions.Item>
+              <Descriptions.Item label="角色">{record.actor_role || '-'}</Descriptions.Item>
+              <Descriptions.Item label="动作">{record.action || '-'}</Descriptions.Item>
+              <Descriptions.Item label="关联租户">
+                <span style={{ fontFamily: 'var(--font-mono)' }}>
+                  {record.target_tenant_id || '-'}
+                </span>
+              </Descriptions.Item>
+              <Descriptions.Item label="完整详情">
+                <span style={{ fontFamily: 'var(--font-mono)', wordBreak: 'break-all' }}>
+                  {record.detail || '-'}
+                </span>
+              </Descriptions.Item>
+            </Descriptions>
+          ),
+        }}
       />
     </Card>
   );
