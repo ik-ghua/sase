@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net"
+	"runtime"
 	"sync"
 )
 
@@ -14,7 +15,9 @@ import (
 // 即便源地址被伪造成某站点,伪造者无该会话密钥 → `sess.Open` 失败丢弃,不产生跨租户明文转发。
 // 入向解复用(srcAddr→site)dev/非 NAT 可行;NAT 下须用握手协商的 receiver-index(待握手/审查)。
 //
-// 骨架性能限:单 Serve goroutine 串行收发——生产需 worker pool/SO_REUSEPORT。
+// 收发已由单 goroutine 升级为 worker pool(见 Serve):N 个 worker 各自从同一 net.PacketConn 并发
+// ReadFrom(Go UDPConn.ReadFrom 并发安全,每次一个完整数据报)→ Handle → WriteTo,吃满多核;
+// SO_REUSEPORT(多 socket 分摊内核队列)为后续生产项。
 // 选路已由线性全表扫描升级为每租户 v4/v6 LPM trie(见 lpm.go),热路径 O(地址位宽)、与站点/CIDR 数无关。
 
 // siteEntry 是 PoP 上一个已接入站点的隧道状态。
@@ -247,23 +250,46 @@ func parse5Tuple(pkt []byte) (Packet5Tuple, bool) {
 	return t, true
 }
 
-// Serve 在 conn 上收 UDP 数据报、经 Router 转发,直到 ctx 取消。
+// Serve 在 conn 上以 worker pool 收 UDP 数据报、经 Router 并发转发,直到 ctx 取消后所有 worker 干净退出。
+//
+// 并发安全论证:① net.UDPConn/PacketConn 的 ReadFrom 多 goroutine 并发安全,每次返回一个完整数据报
+// (UDP 面向消息,运行时内部串行化读、不会撕裂);② 每 worker 持**独立 buf**,互不共享(否则并发 ReadFrom
+// 写同一缓冲 = data race);Handle 入参又经 append 拷贝为独立切片;③ Handle 经 RWMutex + 每会话 Session.mu
+// 保护,与 Register/Deregister 并发安全;④ WriteTo 多 goroutine 并发安全(UDP sendto 单数据报原子)。
+// 全程无 worker 间共享可变状态。
+//
+// worker 数默认 runtime.NumCPU()(至少 1):单核机退化为 1 worker,等价原单 goroutine 行为。
 func (r *Router) Serve(ctx context.Context, conn net.PacketConn) {
+	// ctx 取消 → 关闭 conn,令所有阻塞在 ReadFrom 的 worker 一并出错返回(复用原单 goroutine 模式)。
 	go func() { <-ctx.Done(); _ = conn.Close() }()
-	buf := make([]byte, maxDatagram)
-	for {
-		n, src, err := conn.ReadFrom(buf)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("[dptunnel] PoP 读 UDP: %v", err)
-			return
-		}
-		for _, o := range r.Handle(append([]byte(nil), buf[:n]...), src) {
-			if _, err := conn.WriteTo(o.Data, o.Addr); err != nil {
-				log.Printf("[dptunnel] PoP 转发: %v", err)
-			}
-		}
+
+	workers := runtime.NumCPU()
+	if workers < 1 {
+		workers = 1
 	}
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, maxDatagram) // 每 worker 独立 buf,杜绝并发 ReadFrom 写同缓冲的 data race
+			for {
+				n, src, err := conn.ReadFrom(buf)
+				if err != nil {
+					if ctx.Err() != nil {
+						return // ctx 取消触发的 conn.Close → 正常退出
+					}
+					// conn 已关闭(ctx 取消)对所有 worker 报错;非取消的真实读错才记日志。
+					log.Printf("[dptunnel] PoP 读 UDP: %v", err)
+					return
+				}
+				for _, o := range r.Handle(append([]byte(nil), buf[:n]...), src) {
+					if _, err := conn.WriteTo(o.Data, o.Addr); err != nil {
+						log.Printf("[dptunnel] PoP 转发: %v", err)
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
