@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+// 包 sase.control.v1:Agent↔控制面 的终端实时控制通道契约(ZTNA 硬化 L2 3.4 层②"端提速")。
+package sase.control.v1;
+
+option go_package = "github.com/ikuai8/sase/api/proto/sase/control/v1;controlpb";
+
+// AgentControl 是 Agent↔控制面 的持久双向流(终端实时控制)。
+// 权威仍在 PoP(吊销表 + 短 TTL,ZTNA 硬化 L2 3.4 层①③);本通道仅加速端侧反应(层②),best-effort:
+// 通道断/丢消息不影响安全——PoP 仍按吊销表+短 TTL 兜底。
+service AgentControl {
+  // Channel:Agent 建立长连,首条 AgentEvent{kind=hello,token} 注册身份;
+  // 之后控制面经返回流下推 ControlCommand(撤销/重认证/重采姿态),Agent 上报姿态/ACK。
+  rpc Channel(stream AgentEvent) returns (stream ControlCommand);
+}
+
+// AgentEvent 是 Agent → 控制面 的消息。
+message AgentEvent {
+  string kind    = 1; // hello | posture | ack
+  string token   = 2; // kind=hello:会话凭证(控制面验签确定 tenant/subject/jti)
+  string posture = 3; // kind=posture:设备姿态(如 "compliant" / "non-compliant")
+}
+
+// ControlCommand 是 控制面 → Agent 的指令。
+message ControlCommand {
+  string kind   = 1; // revoke | reauth | recheck_posture
+  string jti    = 2; // kind=revoke:目标凭证 jti(Agent 比对本地会话,命中即弃用)
+  string reason = 3;
+}

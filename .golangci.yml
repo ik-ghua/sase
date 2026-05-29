@@ -25,5 +25,9 @@ issues:
     # 测试文件放宽:安全扫描/错误检查
     - path: _test\.go
       linters: [gosec, errcheck, bodyclose]
+    # 测试 helper 惯例 `t *testing.T` 在前(优于 ctx 在前),放宽 revive context-as-argument
+    - path: _test\.go
+      text: context-as-argument
+      linters: [revive]
   max-issues-per-linter: 0
   max-same-issues: 0

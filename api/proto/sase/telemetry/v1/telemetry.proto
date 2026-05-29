@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+// 包 sase.telemetry.v1:数据面(PoP)→ 控制面(单元③)的事件上报契约(L1 3.14 可观测 / 单元③ 遥测管道)。
+// 本刀起步:承载风险信号事件(DLP 命中等)使其跨进程到达控制面风险引擎,闭环 DLP→风险→撤销。
+// 后续:接完整遥测(指标/采样 Tracing/审计)与 VictoriaMetrics/ClickHouse(运维 L2 3.4)。
+package sase.telemetry.v1;
+
+option go_package = "github.com/ikuai8/sase/api/proto/sase/telemetry/v1;telemetrypb";
+
+// Telemetry 是数据面向控制面上报事件的服务(mTLS,与控制通道同 gRPC server)。
+service Telemetry {
+  // Report:PoP 批量上报事件(unary,best-effort;不阻塞数据面热路径,PoP 侧异步缓冲发送)。
+  rpc Report(ReportRequest) returns (ReportResponse);
+}
+
+message ReportRequest {
+  repeated Event events = 1;
+}
+
+message ReportResponse {
+  int32 accepted = 1; // 已接收事件数(信息性)
+}
+
+// Event 是一条遥测事件(风险信号 / 审计 / 观测)。attrs 通用键值,按 kind 解释(避免每事件类型重定义信封)。
+message Event {
+  string              tenant_id    = 1;
+  string              subject      = 2;
+  string              jti          = 3; // 关联会话凭证(供风险突变定位撤销目标)
+  string              kind         = 4; // "dlp_finding" | …(后续扩展)
+  map<string, string> attrs        = 5; // kind=dlp_finding: rule/severity/action
+  int64               ts_unix_nano = 6;
+}

@@ -1,0 +1,929 @@
+openapi: 3.1.0
+info:
+  title: SASE Admin API
+  version: 0.1.0
+  description: >
+    SASE 控制面 Admin REST API（L1 3.11 单一来源)。**本 spec 是手写权威契约**:前端从它生成 TS 类型/client;
+    后端实现与之的一致性由 CI 测试 `internal/admin/httpapi/openapi_conformance_test.go` 双向对账(路径↔
+    `httpapi.AdminRoutePatterns`)。新增/改端点须同时改本 spec、`AdminRoutePatterns` 与 handler,否则 CI 红。
+    范围 = Admin API(api mux,/api/v1/);设备面 /renew(:8444)是设备端点、不在本 spec。
+servers:
+  - url: /
+    description: 控制面 Admin API（管理面 HTTPS;浏览器↔控制面国密 TLS 由前置终结,前端算法无关)
+security:
+  - bearerAuth: []          # 默认:Bearer admin 令牌(authz 后端强制);公开端点在各自 security: [] 覆盖
+tags:
+  - name: tenants
+  - name: identity
+  - name: resources
+  - name: policy
+  - name: credentials
+  - name: audit
+  - name: security-swg
+  - name: security-fw
+  - name: security-dlp
+  - name: sdwan
+  - name: enrollment
+  - name: platform
+  - name: trust
+
+paths:
+  /api/v1/tenants:
+    post:
+      tags: [tenants]
+      summary: 开通租户(平台级,platform_admin)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/Tenant' } } }
+      responses:
+        '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/Tenant' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/tenants/{tid}:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    get:
+      tags: [tenants]
+      summary: 取租户详情
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Tenant' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [tenants]
+      summary: 部分更新租户(平台运维:停用/恢复/改名;platform_admin only,租户管理员不可改自身)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TenantPatch' } } }
+      responses:
+        '200': { description: 已更新, content: { application/json: { schema: { $ref: '#/components/schemas/Tenant' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/tenants/{tid}/users:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [identity]
+      summary: 创建用户
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
+      responses: { '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } } }
+    get:
+      tags: [identity]
+      summary: 列出本租户用户
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/User' } } } } } }
+
+  /api/v1/tenants/{tid}/apps:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [resources]
+      summary: 注册应用(ZTNA)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/App' } } } }
+      responses: { '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/App' } } } } }
+    get:
+      tags: [resources]
+      summary: 列出应用
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/App' } } } } } }
+
+  /api/v1/tenants/{tid}/connectors:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [resources]
+      summary: 注册连接器
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Connector' } } } }
+      responses: { '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/Connector' } } } } }
+    get:
+      tags: [resources]
+      summary: 列出连接器
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Connector' } } } } } }
+
+  /api/v1/tenants/{tid}/policies:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [policy]
+      summary: 创建策略(编写态)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Policy' } } } }
+      responses: { '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/Policy' } } } } }
+
+  /api/v1/tenants/{tid}/policies/compile:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [policy]
+      summary: 编译并原子激活策略(产 PolicyBundle;幂等)
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/CompileResult' } } } } }
+
+  /api/v1/tenants/{tid}/policies/bundle:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    get:
+      tags: [policy]
+      summary: 取当前激活的 PolicyBundle
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/CompileResult' } } } } }
+
+  /api/v1/tenants/{tid}/credentials:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [credentials]
+      summary: 签发短 TTL 会话凭证
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/IssueCredentialRequest' } } } }
+      responses: { '201': { description: 已签发, content: { application/json: { schema: { $ref: '#/components/schemas/IssueCredentialResponse' } } } } }
+
+  /api/v1/tenants/{tid}/credentials/revoke:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [credentials]
+      summary: 按 jti 撤销凭证(秒级失效)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RevokeCredentialRequest' } } } }
+      responses: { '200': { description: 已撤销, content: { application/json: { schema: { $ref: '#/components/schemas/StatusJTI' } } } } }
+
+  /api/v1/tenants/{tid}/audit:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    get:
+      tags: [audit]
+      summary: 读本租户审计日志(只读;auditor 可读)
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AuditEntry' } } } } } }
+
+  /api/v1/tenants/{tid}/idp/configs:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [identity]
+      summary: 创建 IdP 配置(client_secret 经租户 DEK 加密落库,secret 模块首个加密消费者)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateIdPConfigRequest' } } } }
+      responses:
+        '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/IdPConfig' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { description: 租户 DEK 未就绪或已销毁(无法加密) }
+    get:
+      tags: [identity]
+      summary: 列出 IdP 配置(不含 client_secret)
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/IdPConfig' } } } } } }
+
+  /api/v1/tenants/{tid}/idp/configs/{cid}:
+    parameters:
+      - { $ref: '#/components/parameters/Tid' }
+      - { name: cid, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [identity]
+      summary: 取 IdP 配置详情(不含 client_secret)
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/IdPConfig' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [identity]
+      summary: 部分更新 IdP 配置(可选改 client_secret)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateIdPConfigRequest' } } } }
+      responses:
+        '200': { description: 已更新, content: { application/json: { schema: { $ref: '#/components/schemas/IdPConfig' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: DEK 已销毁,无法更新 client_secret }
+    delete:
+      tags: [identity]
+      summary: 删除 IdP 配置(audit_tr 留痕)
+      responses:
+        '204': { description: 已删除 }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/tenants/{tid}/swg/rules:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [security-swg]
+      summary: 创建 SWG 规则(URL 过滤)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SWGRule' } } } }
+      responses: { '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/SWGRule' } } } } }
+    get:
+      tags: [security-swg]
+      summary: 列出 SWG 规则
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/SWGRule' } } } } } }
+
+  /api/v1/tenants/{tid}/sites:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [sdwan]
+      summary: 注册站点(SD-WAN)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Site' } } } }
+      responses: { '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/Site' } } } } }
+    get:
+      tags: [sdwan]
+      summary: 列出站点
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Site' } } } } } }
+
+  /api/v1/tenants/{tid}/fw/rules:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [security-fw]
+      summary: 创建 FWaaS 规则(L3/L4)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/FWRule' } } } }
+      responses: { '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/FWRule' } } } } }
+    get:
+      tags: [security-fw]
+      summary: 列出 FWaaS 规则
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/FWRule' } } } } } }
+
+  /api/v1/tenants/{tid}/dlp/rules:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [security-dlp]
+      summary: 创建 CASB-DLP 规则
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DLPRule' } } } }
+      responses: { '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/DLPRule' } } } } }
+    get:
+      tags: [security-dlp]
+      summary: 列出 CASB-DLP 规则
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/DLPRule' } } } } } }
+
+  /api/v1/tenants/{tid}/enrollments:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [enrollment]
+      summary: 生成 ZTP 一次性激活码(connector / cpe)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateEnrollmentRequest' } } } }
+      responses: { '201': { description: 已生成, content: { application/json: { schema: { $ref: '#/components/schemas/ActivationCode' } } } } }
+
+  /api/v1/tenants/{tid}/devices/revoke:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [enrollment]
+      summary: 撤销设备(撤销后续期被拒)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RevokeDeviceRequest' } } } }
+      responses: { '200': { description: 已撤销, content: { application/json: { schema: { $ref: '#/components/schemas/StatusIdentity' } } } } }
+
+  /api/v1/platform/tenants:
+    get:
+      tags: [platform]
+      summary: 跨租户列出全租户摘要(平台运维,platform_admin;经 InPlatformTx 读策展视图)
+      responses: { '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/TenantSummary' } } } } } }
+
+  /api/v1/platform/tenants/{tid}/decommission:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [platform]
+      summary: 标注租户进入注销宽限期(软删→宽限→硬删 DEK;platform_admin only;对已 offboarding 租户重复调用会顺延宽限期末)
+      requestBody:
+        required: false
+        content: { application/json: { schema: { $ref: '#/components/schemas/DecommissionRequest' } } }
+      responses:
+        '200': { description: 已进入注销宽限期, content: { application/json: { schema: { $ref: '#/components/schemas/Tenant' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/platform/tenants/{tid}/decommission/cancel:
+    parameters: [ { $ref: '#/components/parameters/Tid' } ]
+    post:
+      tags: [platform]
+      summary: 宽限期内取消注销(回 active;platform_admin only)
+      responses:
+        '200': { description: 已取消注销, content: { application/json: { schema: { $ref: '#/components/schemas/Tenant' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: 租户不在注销宽限期,无法取消 }
+
+  /api/v1/platform/decommissions/sweep:
+    post:
+      tags: [platform]
+      summary: 硬删自动清扫(扫描宽限期已到的租户:DEK 销毁 + 状态→decommissioned;platform_admin only)
+      description: |
+        串起 Slice33c(注销宽限期)与 Slice34(secret DEK 销毁)的端到端硬删:
+        ① 经平台路径跨租户列 status='offboarding' AND decommission_at<now 的租户;
+        ② 每条:secret.DestroyTenantKey(DEK 销毁,**L1 3.16 不可逆**)→ tenant.Update status=decommissioned。
+        两步各自原子幂等→**重跑安全**;失败租户进 skipped 不阻塞其它。
+        **诚实状态:** 当前无业务数据用 DEK 加密(Slice34 基础设施先于消费者),DEK 销毁此刻是符号性的;
+        待首个加密消费者(IdPConfig 等)接入,本端点完成后数据将真正不可恢复。
+      responses:
+        '200':
+          description: 扫描完成(可能 0 条 due)
+          content: { application/json: { schema: { $ref: '#/components/schemas/DecommissionSweepResult' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/platform/admin-tokens:
+    post:
+      tags: [platform]
+      summary: 平台签发 admin 令牌(临时机制,platform_admin only)
+      description: |
+        本端点为 IdP-based 管理员登录到位前的**临时机制**:平台 mint 签名令牌(≤12h TTL,Role+TenantID claim)。
+        **支持 role**(Slice38c 起):
+          - `tenant_admin` / `auditor` — **必带 `tenant_id`**(作用域租户;审计落 target tenant);
+          - `platform_admin`(Slice38c)— **必查 `platform_admins` 表 IsActive(subject)** + **必空 `tenant_id`**(跨租户);
+            subject 不在表/disabled → 403;RBAC 服务未配置(SASE_DB_PLATFORM_RW_DSN 未设)→ 503;**bootstrap env 绕过本表**(应急通道,生产应立即用该令牌 POST /platform/admins 登记自己)。
+        **disable/delete platform_admin 不即时撤销已签出令牌**:剩余 TTL(≤12h)内仍有效;即时吊销需后续刀建 admin 令牌撤销表。
+        **detail 审计只记 subject+role,不记 token**(凭证泄露面)。生产终态应走 IdP→换令牌。
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/IssueAdminTokenRequest' } } }
+      responses:
+        '200': { description: 已签发, content: { application/json: { schema: { $ref: '#/components/schemas/IssueAdminTokenResponse' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: '调用者非 platform_admin / platform_admin subject 不在 RBAC 表/disabled' }
+        '503': { description: 'platform RBAC 未配置(role=platform_admin 路径需)' }
+
+  /api/v1/platform/pop-nodes:
+    post:
+      tags: [platform]
+      summary: 新建 PoP 节点(platform_admin only;Slice38a / PC-API-3)
+      description: |
+        PoP = 平台级共享基础设施(非租户数据,无 tenant_id);写经 app_platform_rw 专用池。
+        `name` UNIQUE 防重(409 ErrPopAlreadyExists);**name/region/endpoint 不可后续修改**(防 ID 漂移)。
+        未配 SASE_DB_PLATFORM_RW_DSN → 503。
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CreatePopRequest' } } }
+      responses:
+        '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/PoP' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: name 已存在 }
+        '503': { description: 平台写池未配置 }
+    get:
+      tags: [platform]
+      summary: 列 PoP 节点(平台运维/前端容量看板数据源)
+      responses:
+        '200':
+          description: PoP 列表
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/PoP' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { description: 平台写池未配置 }
+
+  /api/v1/platform/pop-nodes/{pid}:
+    get:
+      tags: [platform]
+      summary: 取单个 PoP 详情
+      parameters:
+        - { name: pid, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: PoP, content: { application/json: { schema: { $ref: '#/components/schemas/PoP' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: PoP 不存在 }
+        '503': { description: 平台写池未配置 }
+    patch:
+      tags: [platform]
+      summary: 更新 PoP(仅 status / max_users 可改;name/region/endpoint 不可改)
+      parameters:
+        - { name: pid, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/PopPatch' } } }
+      responses:
+        '200': { description: 更新后 PoP, content: { application/json: { schema: { $ref: '#/components/schemas/PoP' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: PoP 不存在 }
+        '503': { description: 平台写池未配置 }
+
+  /api/v1/platform/audit:
+    get:
+      tags: [platform]
+      summary: 平台级审计读端点(Slice39,与 tenant audit_log /api/v1/tenants/{tid}/audit 对称)
+      description: |
+        平台级操作(PoP CRUD / 未来 CA·KEK / 平台 RBAC)的双层审计:**source=data**(DB 触发器
+        platform_audit_row 业务事务内原子写,result=0 哨兵)+ **source=api**(handler 显式写,
+        含失败 4xx/500,覆盖 2xx-零变更盲区)。authz 限 platform_admin。
+        SASE_DB_PLATFORM_RW_DSN 未设 → 503。
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 100, maximum: 1000, minimum: 1 }
+      responses:
+        '200':
+          description: 审计列表(按 ts DESC)
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/PlatformAuditEntry' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { description: 平台审计未配置 }
+
+  /api/v1/platform/admins:
+    post:
+      tags: [platform]
+      summary: 新建 platform_admin(Slice38c,平台管理员持久化 RBAC)
+      description: |
+        登记一枚 platform_admin 主体到 platform_admins 表;**该主体登记后才能经 `/platform/admin-tokens`
+        签发 role=platform_admin 令牌**(bootstrap env 例外,应急通道)。authz 默认分支已限 platform_admin。
+        SASE_DB_PLATFORM_RW_DSN 未设 → 503;subject 重复 → 409。
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CreatePlatformAdminRequest' } } }
+      responses:
+        '201': { description: 已创建, content: { application/json: { schema: { $ref: '#/components/schemas/PlatformAdmin' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: subject 已存在 }
+        '503': { description: 平台 RBAC 未配置 }
+    get:
+      tags: [platform]
+      summary: 列 platform_admin
+      responses:
+        '200':
+          description: 管理员列表(按 created_at 升序)
+          content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/PlatformAdmin' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { description: 平台 RBAC 未配置 }
+
+  /api/v1/platform/admins/{aid}:
+    get:
+      tags: [platform]
+      summary: 取 platform_admin 详情
+      parameters:
+        - { name: aid, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: PlatformAdmin, content: { application/json: { schema: { $ref: '#/components/schemas/PlatformAdmin' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: 管理员不存在 }
+        '503': { description: 平台 RBAC 未配置 }
+    patch:
+      tags: [platform]
+      summary: 更新 platform_admin(status / email);subject 不可改
+      description: |
+        **disable 不即时撤销已签出的 platform_admin token**:剩余 TTL(≤12h)内仍有效;
+        即时吊销需后续刀建 admin 令牌撤销表(对照 ZTNA 凭证撤销机制)。
+        **B5 防自助锁死**:disable 自己被拒(400);请请另一名 platform_admin 操作,或后续做 last-admin 检查。
+      parameters:
+        - { name: aid, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/PlatformAdminPatch' } } }
+      responses:
+        '200': { description: 更新后, content: { application/json: { schema: { $ref: '#/components/schemas/PlatformAdmin' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: 管理员不存在 }
+        '503': { description: 平台 RBAC 未配置 }
+    delete:
+      tags: [platform]
+      summary: 删除 platform_admin(**禁止删除自己**防锁死;disable 也不可)
+      description: |
+        **delete 不即时撤销已签出的 platform_admin token**:剩余 TTL(≤12h)内仍有效;
+        即时吊销需后续刀建 admin 令牌撤销表。
+        **B5 防自助锁死**:删自己被拒(400)。删他人后,该 subject 后续无法再签发 platform_admin token。
+      parameters:
+        - { name: aid, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: 已删除, content: { application/json: { schema: { type: object, properties: { id: { type: string, format: uuid } } } } } }
+        '400': { description: 删自己被拒(用 PATCH disabled 替代) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: 管理员不存在 }
+        '503': { description: 平台 RBAC 未配置 }
+
+  /api/v1/trust/pubkey:
+    get:
+      tags: [trust]
+      summary: 取签发公钥(公开;pop-agent 引导用,公钥非密)
+      security: []
+      responses: { '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/TrustPubkey' } } } } }
+
+  /api/v1/enroll:
+    post:
+      tags: [enrollment]
+      summary: ZTP 兑换(公开;设备凭激活码 + CSR 换租户绑定证书;按 IP 限流)
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RedeemRequest' } } } }
+      responses:
+        '200': { description: 已签发证书, content: { application/json: { schema: { $ref: '#/components/schemas/RedeemResponse' } } } }
+        '429': { description: 限流(激活码枚举/暴力防护) }
+
+  /api/v1/idp/login:
+    get:
+      tags: [oidc]
+      summary: IdP OIDC 登录入口(公开;303 跳 IdP authorize URL,PKCE S256)
+      description: |
+        前端按 query `tenant_id` + `idp_id` 拼出此 URL 让浏览器跳转。
+        服务端 ① 读 IdPConfig(必须 status=active)② 解密 client_secret(短窗内存)③ 生成 PKCE code_verifier + 服务端 state ID ④ 303 跳 IdP。
+        SASE_OIDC_CALLBACK_URL 未设时 → 503(端点存在但未配置)。
+      security: []
+      parameters:
+        - name: tenant_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: idp_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: return_to
+          in: query
+          required: false
+          schema: { type: string }
+          description: |
+            登录成功后浏览器跳回的 SPA 路径(同源相对路径,以 / 开头但不以 // 开头,不含反斜杠);
+            不合规一律退默认 "/"(防 open-redirect 攻击);落服务端 state,客户端不能改。
+      responses:
+        '303': { description: 跳 IdP authorize URL, headers: { Location: { schema: { type: string } } } }
+        '400': { description: 缺/非法 query }
+        '403': { description: IdP 已禁用(status=disabled) }
+        '404': { description: IdP 配置不存在 }
+        '409': { description: IdP 密钥不可用(DEK 销毁/未建) }
+        '502': { description: OIDC discovery 失败(IdP 不可达/issuer 错) }
+        '503': { description: OIDC 未配置(部署未启) }
+
+  /api/v1/idp/callback:
+    get:
+      tags: [oidc]
+      summary: IdP OIDC 回调(公开;state TakeOnce → 换 token → EnsureUser → 签会话凭证)
+      description: |
+        单一 callback URL 对所有租户/IdP 复用,租户/IdP 信息走服务端 state(不走 query → 防 CSRF + 跨租户切换)。
+        **响应形态按 Accept 头分流(Slice37c)**:
+          - **Accept 含 `text/html`(浏览器)** → 302 Location: rec.ReturnTo + Set-Cookie sase_session(httpOnly,SameSite=Lax);
+          - **其它(API 客户端/curl/默认)** → 200 + JSON 会话凭证(向后兼容)。
+      security: []
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+        - name: error
+          in: query
+          required: false
+          schema: { type: string }
+          description: IdP 端拒绝/出错时回的标准 OAuth2 error 参数
+      responses:
+        '200':
+          description: 会话凭证(默认/编程客户端)
+          content: { application/json: { schema: { $ref: '#/components/schemas/OIDCCallbackResponse' } } }
+        '302':
+          description: 浏览器路径(Accept 含 text/html);跳 return_to + Set-Cookie sase_session
+          headers:
+            Location: { schema: { type: string } }
+            Set-Cookie: { schema: { type: string, example: 'sase_session=<jwt>; Path=/; Max-Age=1800; HttpOnly; SameSite=Lax' } }
+        '400': { description: state 不存在/过期/缺 code/IdP 错 }
+        '401': { description: IdP 认证失败(id_token 校验/userinfo 拒) }
+        '403': { description: IdP 已禁用 }
+        '409': { description: IdP 密钥不可用 }
+        '502': { description: OIDC discovery 失败 }
+        '503': { description: OIDC 未配置 }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Bearer admin 令牌(cred 签名带 Role;授权后端强制,前端鉴权不可信)
+
+  parameters:
+    Tid:
+      name: tid
+      in: path
+      required: true
+      description: 租户 ID(UUID)
+      schema: { type: string, format: uuid }
+
+  responses:
+    BadRequest:   { description: 请求非法 }
+    Unauthorized: { description: 未认证(无/无效 Bearer 令牌) }
+    Forbidden:    { description: 越权(authz 后端拒绝) }
+    NotFound:     { description: 未找到 }
+
+  schemas:
+    Tenant:
+      type: object
+      properties:
+        id:                  { type: string, format: uuid, description: 留空则后端生成 }
+        name:                { type: string }
+        status:              { type: string, enum: [active, suspended, offboarding] }
+        plan:                { type: string, description: "加密档/订阅档(standard/gm/...,业务命名,后端不枚举校验)" }
+        decommission_at:     { type: [string, "null"], format: date-time, description: 计划硬删时刻(注销宽限期末);null=未注销 }
+        max_users:           { type: [integer, "null"], minimum: 0, description: 用户数上限;null=不限 }
+        max_policies:        { type: [integer, "null"], minimum: 0, description: 策略数上限;null=不限 }
+        max_bandwidth_mbps:  { type: [integer, "null"], minimum: 0, description: 带宽上限 Mbps;null=不限 }
+      required: [name]
+    DecommissionRequest:
+      type: object
+      description: 注销宽限期(可选;grace_hours<=0 或缺省 → 服务端默认 30 天)
+      properties:
+        grace_hours: { type: integer, description: 宽限期小时数;0/缺省用默认 }
+    TenantPatch:
+      type: object
+      description: |
+        租户部分更新(PATCH 语义:不提供=不改;提供即设)。
+        **配额语义**:0=完全限死(业务硬封顶,有意支持,运维须显式);>0=上限;不能表达"改回 null/不限"(LP-PC1 后续 clear-flag/sentinel)。
+      properties:
+        name:                { type: string }
+        status:              { type: string, enum: [active, suspended, offboarding] }
+        plan:                { type: string }
+        max_users:           { type: integer, minimum: 0 }
+        max_policies:        { type: integer, minimum: 0 }
+        max_bandwidth_mbps:  { type: integer, minimum: 0 }
+    TenantSummary:
+      type: object
+      description: 平台跨租户只读策展视图字段(不含用户/策略明细)
+      properties:
+        id:                 { type: string, format: uuid }
+        name:               { type: string }
+        status:             { type: string }
+        plan:               { type: string }
+        created_at:         { type: string, format: date-time }
+        decommission_at:    { type: [string, "null"], format: date-time }
+        max_users:          { type: [integer, "null"], description: 用户数上限;null=不限 }
+        max_policies:       { type: [integer, "null"], description: 策略数上限;null=不限 }
+        max_bandwidth_mbps: { type: [integer, "null"], description: 带宽上限 Mbps;null=不限 }
+    User:
+      type: object
+      properties:
+        id:          { type: string }
+        tenant_id:   { type: string, format: uuid }
+        external_id: { type: string, description: IdP 侧主键 }
+        email:       { type: string }
+        status:      { type: string, enum: [active, disabled] }
+    App:
+      type: object
+      properties:
+        id:        { type: string }
+        tenant_id: { type: string, format: uuid }
+        app_key:   { type: string }
+        name:      { type: string }
+        upstream:  { type: string }
+      required: [app_key, name]
+    Connector:
+      type: object
+      properties:
+        id:        { type: string }
+        tenant_id: { type: string, format: uuid }
+        app_key:   { type: string }
+        name:      { type: string }
+    Policy:
+      type: object
+      properties:
+        id:            { type: string }
+        name:          { type: string }
+        priority:      { type: integer }
+        subject_kind:  { type: string, description: "group | device-posture | risk_gte | ..." }
+        subject_value: { type: string }
+        resource:      { type: string }
+        action:        { type: string }
+        effect:        { type: string, enum: [allow, deny, inspect] }
+    CompileResult:
+      type: object
+      description: 编译/激活结果(PolicyBundle 摘要)
+      properties:
+        version:      { type: integer, format: int64 }
+        content_hash: { type: string }
+        changed:      { type: boolean, description: false=内容未变、未产新版、未下发(幂等) }
+    AuditEntry:
+      type: object
+      properties:
+        tenant_id:     { type: string, format: uuid }
+        ts:            { type: string, format: date-time }
+        actor_subject: { type: string }
+        actor_role:    { type: string }
+        action:        { type: string, description: "api 源=HTTP 动作;data 源=TG_OP 表名" }
+        result:        { type: integer, description: "api 源=HTTP 码;data 源=0 哨兵" }
+        detail:        { type: string }
+        source:        { type: string, enum: [api, data], description: api=HTTP 中间件 / data=DB 触发器(原子) }
+    SWGRule:
+      type: object
+      properties:
+        kind:    { type: string }
+        pattern: { type: string }
+        action:  { type: string }
+    FWRule:
+      type: object
+      properties:
+        priority:     { type: integer }
+        action:       { type: string, enum: [allow, deny] }
+        protocol:     { type: string, enum: [any, tcp, udp, icmp] }
+        src_cidr:     { type: string }
+        dst_cidr:     { type: string }
+        dst_port_min: { type: integer, minimum: 0, maximum: 65535 }
+        dst_port_max: { type: integer, minimum: 0, maximum: 65535 }
+    DLPRule:
+      type: object
+      properties:
+        name:       { type: string }
+        match_type: { type: string, enum: [keyword, regex] }
+        pattern:    { type: string }
+        action:     { type: string, enum: [block, alert] }
+        severity:   { type: string, enum: [low, medium, high] }
+    Site:
+      type: object
+      properties:
+        id:        { type: string }
+        tenant_id: { type: string, format: uuid }
+        site_key:  { type: string }
+        name:      { type: string }
+        cidr:      { type: string }
+      required: [site_key, cidr]
+    DecommissionSweepResult:
+      type: object
+      properties:
+        processed: { type: array, items: { type: string, format: uuid }, description: 成功硬删的租户 id 列表 }
+        skipped:
+          type: array
+          description: 失败/跳过的租户(各租户独立,不阻塞其它)
+          items:
+            type: object
+            properties:
+              tenant_id: { type: string, format: uuid }
+              reason:    { type: string }
+    IdPConfig:
+      type: object
+      description: IdP 配置(**响应有意不含 client_secret**,防意外序列化;明文 secret 仅在 adapter 内部 GetClientSecret 取)
+      properties:
+        id:         { type: string, format: uuid }
+        tenant_id:  { type: string, format: uuid }
+        name:       { type: string }
+        kind:       { type: string, enum: [oidc, wecom, dingtalk, feishu], description: "IdP 形态(标准 OIDC + 三家国产 IdP:企微/钉钉/飞书均已落地,Slice37b-1/-2)" }
+        endpoint:   { type: string }
+        client_id:  { type: string }
+        status:     { type: string, enum: [active, disabled] }
+        extra:
+          type: object
+          additionalProperties: true
+          description: |
+            可选 IdP 私有化部署/灰度域名经此扩展字段配置(Slice37c):
+              - wecom_auth_host    企微 authorize host(默认 https://open.weixin.qq.com)
+              - dingtalk_oauth_host 钉钉 OAuth host(默认 https://login.dingtalk.com)
+              - feishu_auth_host   飞书 authorize host(默认 https://accounts.feishu.cn)
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    CreateIdPConfigRequest:
+      type: object
+      properties:
+        name:          { type: string }
+        kind:          { type: string, enum: [oidc, wecom, dingtalk, feishu] }
+        endpoint:      { type: string, description: "oidc=issuer URL;wecom=API base(空走 https://qyapi.weixin.qq.com);dingtalk=API base(空走 https://api.dingtalk.com);feishu=API base(空走 https://open.feishu.cn)" }
+        client_id:     { type: string, description: "oidc=client_id;wecom=corpid;dingtalk/feishu=app_id" }
+        client_secret: { type: string, description: "明文(oidc=client_secret;wecom=corpsecret;...);服务端 secret.Encrypt 加密落库后丢弃" }
+        extra:         { type: object, additionalProperties: true }
+      required: [name, kind, endpoint, client_id, client_secret]
+    UpdateIdPConfigRequest:
+      type: object
+      description: PATCH 语义:不提供=不改;client_secret 非空 → 重新加密落库
+      properties:
+        name:          { type: string }
+        endpoint:      { type: string }
+        client_id:     { type: string }
+        client_secret: { type: string }
+        status:        { type: string, enum: [active, disabled] }
+        extra:         { type: object, additionalProperties: true }
+    IssueAdminTokenRequest:
+      type: object
+      description: |
+        签发 admin 令牌请求。`tenant_id` **条件必填**:
+          - `role ∈ {tenant_admin, auditor}` → 必填(作用域租户);
+          - `role = platform_admin`(Slice38c)→ **必空**(跨租户),且 subject 必须在 platform_admins 表且 status=active。
+      properties:
+        subject:     { type: string, description: 调用方 subject(将进入 admin 令牌 claim;platform_admin 路径必在 platform_admins 表) }
+        role:        { type: string, enum: [tenant_admin, auditor, platform_admin], description: '见上方 description 的条件必填规则' }
+        tenant_id:   { type: string, format: uuid, description: 作用域租户(tenant_admin/auditor 必填;platform_admin 必空) }
+        ttl_seconds: { type: integer, minimum: 0, description: TTL(秒);0/缺省/超 12h → 钳至 12h(MaxAdminTTL) }
+      required: [subject, role]
+    IssueAdminTokenResponse:
+      type: object
+      properties:
+        token:      { type: string, description: 签名 admin 令牌(cred 格式;不要进任何审计/日志,持有即权限) }
+        subject:    { type: string }
+        role:       { type: string, enum: [tenant_admin, auditor] }
+        tenant_id:  { type: string, format: uuid }
+        expires_at: { type: string, format: date-time }
+    IssueCredentialRequest:
+      type: object
+      properties:
+        user_id:     { type: string }
+        groups:      { type: array, items: { type: string } }
+        posture:     { type: string }
+        ttl_seconds: { type: integer }
+      required: [user_id]
+    IssueCredentialResponse:
+      type: object
+      properties:
+        token: { type: string }
+        jti:   { type: string }
+    RevokeCredentialRequest:
+      type: object
+      properties:
+        jti:     { type: string }
+        subject: { type: string }
+        reason:  { type: string }
+      required: [jti]
+    StatusJTI:
+      type: object
+      properties:
+        status: { type: string }
+        jti:    { type: string }
+    CreateEnrollmentRequest:
+      type: object
+      properties:
+        kind:     { type: string, enum: [connector, cpe] }
+        identity: { type: string, description: 签入证书 CommonName(connector app / cpe site_key) }
+      required: [kind, identity]
+    ActivationCode:
+      type: object
+      properties:
+        activation_code: { type: string }
+    RevokeDeviceRequest:
+      type: object
+      properties:
+        identity: { type: string }
+      required: [identity]
+    StatusIdentity:
+      type: object
+      properties:
+        status:   { type: string }
+        identity: { type: string }
+    TrustPubkey:
+      type: object
+      properties:
+        alg:    { type: string }
+        pubkey: { type: string, description: base64url 公钥 }
+    RedeemRequest:
+      type: object
+      properties:
+        activation_code: { type: string }
+        csr_pem:         { type: string, description: 设备本地生成的 CSR(PEM;私钥不离设备) }
+      required: [activation_code, csr_pem]
+    RedeemResponse:
+      type: object
+      properties:
+        cert_pem: { type: string, description: 租户绑定证书(PEM) }
+
+    PoP:
+      type: object
+      required: [id, name, region, endpoint, status, created_at, updated_at]
+      description: PoP 节点(平台共享基础设施;无 tenant_id)。
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, description: 运营标识(unique) }
+        region: { type: string, description: 地域 }
+        endpoint: { type: string, description: PoP 入口公网地址 }
+        max_users: { type: integer, nullable: true, minimum: 0, description: 容量上限(nil=未设) }
+        status: { type: string, enum: [active, draining, down] }
+        last_seen_at: { type: string, format: date-time, nullable: true, description: heartbeat 最近时间(Slice38a 暂不写) }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    CreatePopRequest:
+      type: object
+      required: [name, region, endpoint]
+      properties:
+        name: { type: string }
+        region: { type: string }
+        endpoint: { type: string }
+        max_users: { type: integer, nullable: true, minimum: 0 }
+    PopPatch:
+      type: object
+      description: PATCH 语义(nil 不改)。仅 status/max_users 可改;name/region/endpoint 故意不可改(防 ID 漂移)。
+      properties:
+        status: { type: string, enum: [active, draining, down], nullable: true }
+        max_users: { type: integer, nullable: true, minimum: 0 }
+
+    PlatformAdmin:
+      type: object
+      required: [id, subject, status, created_at, updated_at]
+      description: 平台管理员持久化记录(Slice38c)。
+      properties:
+        id:         { type: string, format: uuid }
+        subject:    { type: string, description: 主体标识(IdP sub / 运营 ID;UNIQUE) }
+        email:      { type: string, description: 联系邮箱(可空) }
+        status:     { type: string, enum: [active, disabled] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        created_by: { type: string, description: 谁加的(审计;bootstrap 加自己时可空) }
+    CreatePlatformAdminRequest:
+      type: object
+      required: [subject]
+      properties:
+        subject: { type: string }
+        email:   { type: string }
+    PlatformAdminPatch:
+      type: object
+      description: PATCH 语义(nil 不改);仅 status/email 可改;subject 故意不可改(主键级;改名 = 删后重建)。
+      properties:
+        status: { type: string, enum: [active, disabled], nullable: true }
+        email:  { type: string, nullable: true }
+
+    PlatformAuditEntry:
+      type: object
+      required: [id, ts, actor_subject, actor_role, action, result, source]
+      description: 平台审计记录(Slice39;与 tenant audit_log Entry 对称,无 tenant_id,可选 target_tenant_id)。
+      properties:
+        id:               { type: string, format: uuid }
+        ts:               { type: string, format: date-time }
+        actor_subject:    { type: string, description: 主体(空主体兜底 'system') }
+        actor_role:       { type: string, description: 角色(platform_admin / system / ...) }
+        action:           { type: string, description: 'API:如 "POST /api/v1/platform/pop-nodes";触发器:如 "INSERT pop_nodes"' }
+        result:           { type: integer, description: 'HTTP 码(source=api)或 0(source=data 哨兵)' }
+        detail:           { type: string }
+        source:           { type: string, enum: [api, data] }
+        target_tenant_id: { type: string, format: uuid, description: '可选;平台对某租户操作时关联' }
+
+    OIDCCallbackResponse:
+      type: object
+      required: [token, jti, expires_in, user_id]
+      description: OIDC 回调成功返回的 SASE 会话凭证(短 TTL,L1 3.8)。
+      properties:
+        token: { type: string, description: SASE 自签会话凭证(Bearer) }
+        jti: { type: string, description: 凭证 ID(撤销按此键) }
+        expires_in: { type: integer, format: int32, description: TTL 秒 }
+        user_id: { type: string, format: uuid, description: SASE 用户 ID(IdP subject 经 EnsureUserByExternalID 映射) }
+        email: { type: string, description: 邮箱(IdP 返回,可空) }

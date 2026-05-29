@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+// 包 sase.xds.v1:控制面 → PoP 的自定义 xDS 资源契约(单一来源,xDS server L2 3.1 / 编译器 L2 3.9)。
+package sase.xds.v1;
+
+option go_package = "github.com/ikuai8/sase/api/proto/sase/xds/v1;xdspb";
+
+// PolicyBundleResource 是承载编译态 PolicyBundle 的自定义 xDS 资源(对应 L2 的 L7PolicyBundle)。
+// 经 go-control-plane 的 ADS/Delta + 自定义 type URL 下发(type URL:
+// type.googleapis.com/sase.xds.v1.PolicyBundleResource)。
+//
+// 设计取舍:proto 仅作 xDS 信封,payload(compiled)为 api/xdsv1.PolicyBundle 的 JSON 编码 ——
+// 复用既有 payload 契约,避免把每个 L7Rule 字段在 proto 里重述(proto 面最小、演进只改信封)。
+// 资源名(xDS resource_name)约定为 "tenant/<tenant_id>"(命名空间化,xDS server L2 3.1)。
+message PolicyBundleResource {
+  string tenant_id = 1; // 租户
+  int64  version   = 2; // bundle 版本(每租户单调)
+  bytes  compiled  = 3; // api/xdsv1.PolicyBundle 的 JSON
+}
+
+// RevocationList 是按租户的撤销凭证清单(秒级失效,ZTNA 硬化 L2 3.4 / xDS server L2 3.7)。
+// 走与 PolicyBundle 独立的 xDS 流(避免被大 bundle 推送队头阻塞);PoP 验凭证后查此清单,命中即拒。
+// type URL:type.googleapis.com/sase.xds.v1.RevocationList,资源名同为 "tenant/<tenant_id>"。
+message RevocationList {
+  string          tenant_id = 1;
+  int64           version   = 2; // 信息性版本;增量去重由 xDS 内容哈希负责(非此字段)
+  repeated string jtis      = 3; // 被撤销的凭证 jti 集
+}
+
+// SWGRuleSet 是安全能力 SWG 的 URL 过滤规则集(安全栈 L2,挂 inspect 流量)。
+// 经独立 Delta 流下发(复用底座);type URL:type.googleapis.com/sase.xds.v1.SWGRuleSet,资源名 "tenant/<id>"。
+message SWGRuleSet {
+  string          tenant_id = 1;
+  int64           version   = 2;
+  repeated SWGRule rules    = 3;
+}
+
+message SWGRule {
+  string kind    = 1; // host | path_prefix
+  string pattern = 2;
+  string action  = 3; // block
+}
+
+// FWRuleSet 是安全能力 FWaaS(L3/L4 防火墙,P4)的每租户规则集(安全栈 L2,复用同一下发底座)。
+// 经独立 Delta 流下发;type URL:type.googleapis.com/sase.xds.v1.FWRuleSet,资源名 "tenant/<id>"。
+// 执行点:PoP 数据面包路径(dptunnel Router 站点间转发前裁决),实现每租户网络分段。
+message FWRuleSet {
+  string          tenant_id = 1;
+  int64           version   = 2;
+  repeated FWRule rules     = 3;
+}
+
+// FWRule 是一条 L3/L4 防火墙规则(5 元组匹配,优先级首次匹配;默认拒)。
+message FWRule {
+  int32  priority     = 1; // 越小越先匹配
+  string action       = 2; // allow | deny
+  string protocol     = 3; // any | tcp | udp | icmp
+  string src_cidr     = 4; // 源网段(空=any)
+  string dst_cidr     = 5; // 目的网段(空=any)
+  uint32 dst_port_min = 6; // 目的端口范围(0,0 = any)
+  uint32 dst_port_max = 7;
+}
+
+// DLPRuleSet 是安全能力 CASB-DLP(P5)的每租户敏感数据规则集(安全栈 L2,复用同一下发底座)。
+// 经独立 Delta 流下发;type URL:type.googleapis.com/sase.xds.v1.DLPRuleSet,资源名 "tenant/<id>"。
+// 执行点:PoP L7 inspect(与 SWG 同检查点),命中 block 即拒、命中任意即喂风险引擎(DLP 命中→风险)。
+message DLPRuleSet {
+  string           tenant_id = 1;
+  int64            version   = 2;
+  repeated DLPRule rules     = 3;
+}
+
+// DLPRule 是一条 DLP 规则(关键词/正则匹配敏感数据;action block 阻断、alert 仅告警+喂风险)。
+message DLPRule {
+  string name       = 1; // 规则名(如 "身份证号")
+  string match_type = 2; // keyword | regex
+  string pattern    = 3; // 关键词或正则
+  string action     = 4; // block | alert
+  string severity   = 5; // low | medium | high(喂风险引擎的权重)
+}
+
+// SiteConfig 是 SD-WAN 租户路由域的站点清单(L1 3.8;经 xDS 下发给该租户各 CPE)。
+// CPE 据此知道同租户对端站点的子网(把发往这些 CIDR 的流量经 overlay 送 PoP);复用同一下发底座。
+message SiteConfig {
+  string        tenant_id = 1;
+  int64         version   = 2;
+  repeated Site sites     = 3;
+}
+
+message Site {
+  string site_key = 1;
+  string cidr     = 2;
+  string name     = 3;
+}
