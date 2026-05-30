@@ -44,6 +44,7 @@ type idpEnrollResult struct {
 	rotator    *enroll.CertRotator
 	sessionTok string
 	sessionJTI string
+	expiresIn  int // 会话凭证有效期(秒;daemon 据此算到期时刻供刷新环阈值)
 	userID     string
 }
 
@@ -179,6 +180,7 @@ func (d *Daemon) idpEnroll(ctx context.Context) (*idpEnrollResult, error) {
 		rotator:    rotator,
 		sessionTok: resp.SessionToken,
 		sessionJTI: resp.SessionJTI,
+		expiresIn:  resp.ExpiresIn,
 		userID:     resp.UserID,
 	}, nil
 }

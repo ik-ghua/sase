@@ -18,6 +18,9 @@ import (
 // ErrNoSigner 表示未配置签发器,无法签发会话凭证。
 var ErrNoSigner = errors.New("identity: 未配置凭证签发器(NewService 需 WithSigner)")
 
+// ErrUserNotFound 表示按 id 查不到用户(供凭证刷新等交叉核对路径分流)。
+var ErrUserNotFound = errors.New("identity: 用户不存在")
+
 // MaxTTL 是会话凭证最大 TTL(短 TTL 设计前提,L1 3.8)。签发时上限钳制;吊销项 expire_at 以此为界,
 // 保证"撤销项有效期 ≥ 凭证剩余有效期"(撤销发生于签发之后,故 now_revoke+MaxTTL ≥ 凭证 exp)——
 // 否则长 TTL 凭证的吊销项会先于凭证过期被滤除,导致被撤销凭证重新可用(fail-open)。
@@ -53,10 +56,16 @@ type Service interface {
 	// GCExpiredRevocations 删除该租户已过期的吊销项(expire_at < now;过期=凭证已自然失效,吊销项无用)。
 	// 租户作用域(RLS),返回删除条数。跨租户全量清扫属运维(app_rw NOBYPASSRLS 不能枚举租户,见实现注释)。
 	GCExpiredRevocations(ctx context.Context, tenantID string) (int64, error)
+	// IsRevoked 经 InTxRO(RLS)查某 jti 是否存在**未过期**的吊销项(供凭证刷新纵深门禁,Slice81 §3.6.1)。
+	// 仅判未过期项:过期吊销项对应凭证本就失效,残留无害(同 GC 语义)。
+	IsRevoked(ctx context.Context, tenantID, jti string) (bool, error)
 	// IssueAdminToken 签发管理面 admin 令牌(带角色;tenantID 为 tenant_admin/auditor 作用域,platform_admin 可空)。
 	IssueAdminToken(ctx context.Context, subject, role, tenantID string, ttl time.Duration) (string, error)
 	// IssuerPublicKey 返回签发公钥(算法无关,下发 PoP 作 TrustBundle 离线验证);未配置返回 ok=false。
 	IssuerPublicKey() (cred.PublicKey, bool)
+	// GetUserStatus 经 InTxRO(RLS)按 id 取用户状态(active/disabled);不存在返 ErrUserNotFound。
+	// 供会话凭证刷新的「用户仍 active」门禁(Slice81 §3.6.1 三闸之一,自愈式注销生效)。
+	GetUserStatus(ctx context.Context, tenantID, userID string) (status string, err error)
 }
 
 // RevocationNotifier 在凭证撤销后被通知,用于向终端实时通道下推(端提速,best-effort;由 control.Hub 实现)。
@@ -176,6 +185,23 @@ func (s *service) GCExpiredRevocations(ctx context.Context, tenantID string) (in
 	return n, err
 }
 
+// IsRevoked 见接口注释。RLS 保证只查本租户吊销项;只计未过期(expire_at > now)的命中。
+func (s *service) IsRevoked(ctx context.Context, tenantID, jti string) (bool, error) {
+	if tenantID == "" || jti == "" {
+		return false, errors.New("identity.IsRevoked: tenant_id 与 jti 必填")
+	}
+	var revoked bool
+	err := s.store.InTxRO(ctx, tenantID, func(q data.Queries) error {
+		row := q.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM revocations WHERE jti = $1 AND expire_at > now())`, jti)
+		return row.Scan(&revoked)
+	})
+	if err != nil {
+		return false, fmt.Errorf("identity.IsRevoked: %w", err)
+	}
+	return revoked, nil
+}
+
 func (s *service) IssueAdminToken(_ context.Context, subject, role, tenantID string, ttl time.Duration) (string, error) {
 	if s.signer == nil {
 		return "", ErrNoSigner
@@ -289,4 +315,26 @@ func (s *service) ListByTenant(ctx context.Context, tenantID string) ([]User, er
 		out = []User{}
 	}
 	return out, nil
+}
+
+// GetUserStatus 经 InTxRO(RLS)按 id 取用户状态。RLS 保证只能读到本租户的行;跨租户 id 不可见 → ErrUserNotFound。
+func (s *service) GetUserStatus(ctx context.Context, tenantID, userID string) (string, error) {
+	if tenantID == "" || userID == "" {
+		return "", errors.New("identity.GetUserStatus: tenant_id 与 user_id 必填")
+	}
+	var status string
+	err := s.store.InTxRO(ctx, tenantID, func(q data.Queries) error {
+		row := q.QueryRow(ctx, `SELECT status FROM users WHERE id = $1`, userID)
+		if scanErr := row.Scan(&status); scanErr != nil {
+			if errors.Is(scanErr, data.ErrNoRows) {
+				return ErrUserNotFound
+			}
+			return fmt.Errorf("identity.GetUserStatus scan: %w", scanErr)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return status, nil
 }

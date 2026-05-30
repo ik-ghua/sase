@@ -66,9 +66,13 @@ type Config struct {
 
 	// 凭证 / 实时通道
 	ControlAddr string        // 控制面实时通道 gRPC 地址(空=不连实时通道,降级:仅靠短 TTL)
-	SessionTok  string        // 会话凭证(本刀由配置给;真实从入网/令牌交换取,刷新调度 = 子块7)
+	SessionTok  string        // 会话凭证(ztp 模式由配置给;idp 模式由入网填运行态 credStore,刷新环自动续)
 	SessionJTI  string        // 会话凭证 jti(撤销匹配用)
 	RenewLead   time.Duration // 设备证书续期提前量(默认 8h,同 cmd/cpe)
+
+	// 会话凭证静默刷新(Slice81,仅 EnrollMode=idp 启;ztp 无 per-user cred 不启)
+	CredRefreshURL string        // 设备 mTLS 刷新端点 base URL(空=用 DeviceURL;默认 https://localhost:8444)
+	RefreshLead    time.Duration // 会话凭证刷新提前量(默认 10min,须 < 会话 TTL 30min;§3.6.1)
 
 	// 姿态
 	PostureInterval time.Duration // 姿态周期采集间隔(默认 5min)
@@ -103,6 +107,12 @@ func (c *Config) withDefaults() {
 	if c.PostureInterval <= 0 {
 		c.PostureInterval = 5 * time.Minute
 	}
+	if c.CredRefreshURL == "" {
+		c.CredRefreshURL = c.DeviceURL // 刷新与续期同设备 mTLS 端点(:8444);DeviceURL 已经 withDefaults 补好
+	}
+	if c.RefreshLead <= 0 {
+		c.RefreshLead = 10 * time.Minute // 短于会话 TTL 30min(§3.6.1)
+	}
 }
 
 // Daemon 是 Agent 守护进程共享核心(平台无关):组装入网/凭证/隧道/实时通道/分流/选址/姿态,长驻运行。
@@ -117,11 +127,20 @@ type Daemon struct {
 	selector *PoPSelector
 	posture  *PostureScheduler
 
+	// creds 持当前会话凭证(idp 模式由入网/刷新环原子更新;ztp 模式从 cfg.SessionTok 一次性填、不刷新)。
+	// runTunnelOnce 每次握手取 creds.Token() 替代 cfg.SessionTok(每轮重连用最新凭证,Slice81 §3.6.1)。
+	creds *credStore
+	// reconnect 是刷新成功 → 主动重握手的信号通道(缓冲 1,非阻塞发);runTunnelOnce select 监听后返回,
+	// retryLoop 用新 cred 重连(跳一次退避)。
+	reconnect chan struct{}
+
 	mu    sync.RWMutex
 	state State
 
 	// retryBackoff:降级后重试退避(可被测试覆盖为 0)。
 	retryBackoff time.Duration
+	// refreshRetryBackoff:会话凭证刷新失败/已过阈值的退避(可被测试缩短);0 → 默认 30s。
+	refreshRetryBackoff time.Duration
 }
 
 // rttProberFunc 是把函数适配为 RTTProber 的便捷类型(默认用 TCP 握手端口连通耗时测 RTT)。
@@ -159,8 +178,15 @@ func New(cfg Config, ncap NetCapture, probe PostureProbe, sys SystemIntegration,
 		sys:          sys,
 		flow:         NewFlowManager(),
 		selector:     NewPoPSelector(prober),
+		creds:        &credStore{},
+		reconnect:    make(chan struct{}, 1),
 		state:        StateEnrolling,
 		retryBackoff: 3 * time.Second,
+	}
+	// ztp 模式由 cfg.SessionTok 一次性填运行态凭证(无 per-user 刷新);idp 模式由入网在 runIDPMode 填。
+	// 到期时刻未知(ztp 无 expires_in)→ 留零值(ztp 不启刷新环,零值不触发刷新)。
+	if cfg.SessionTok != "" {
+		d.creds.Set(cfg.SessionTok, cfg.SessionJTI, time.Time{})
 	}
 	d.selector.SetCandidates(cfg.Candidates)
 	return d
@@ -236,13 +262,20 @@ func (d *Daemon) runIDPMode(ctx context.Context) error {
 			if e != nil {
 				return e
 			}
-			d.cfg.SessionTok, d.cfg.SessionJTI = r.sessionTok, r.sessionJTI
+			d.applyEnrolledCred(r)
 			return d.runWithCert(c, r.tlsConf, r.rotator)
 		})
 	}
-	// IdP 模式的会话凭证来自入网(非 env);填运行态供实时通道 + 撤销匹配(子块7 完整刷新调度为后续刀)。
-	d.cfg.SessionTok, d.cfg.SessionJTI = res.sessionTok, res.sessionJTI
+	// IdP 模式的会话凭证来自入网(非 env);填运行态 credStore(供握手取最新 + 刷新环阈值)。
+	d.applyEnrolledCred(res)
 	return d.runWithCert(ctx, res.tlsConf, res.rotator)
+}
+
+// applyEnrolledCred 把入网产出的会话凭证填运行态:credStore(权威,runTunnelOnce/刷新环用)+ cfg.SessionTok/JTI
+// (供 startControlChannel 实时通道 hello)。到期时刻据入网响应 expires_in 算(刷新环阈值据此)。
+func (d *Daemon) applyEnrolledCred(r *idpEnrollResult) {
+	d.cfg.SessionTok, d.cfg.SessionJTI = r.sessionTok, r.sessionJTI
+	d.creds.Set(r.sessionTok, r.sessionJTI, expiresAtFromIn(r.expiresIn))
 }
 
 // runWithCert 在已拿到设备 mTLS 配置后运行其余阶段(选址→握手→隧道→pump),失败进降级重试循环。
@@ -254,6 +287,14 @@ func (d *Daemon) runWithCert(ctx context.Context, tlsConf *tls.Config, rotator *
 	// 设备证书续期(transport 层,复用 RunRenewLoop;rotator==nil 表示 dev 兜底证书,无续期)。
 	if rotator != nil {
 		go enroll.RunRenewLoop(ctx, rotator, d.cfg.DeviceURL, d.cfg.TLSDir, d.cfg.ServerName, d.cfg.Identity, d.cfg.RenewLead)
+	}
+
+	// 会话凭证静默刷新(app 层,Slice81;仅 idp 模式 + 有设备证书 rotator 时启:出示设备 mTLS + 当前 cred 刷新)。
+	// ztp 模式(无 per-user cred)/ rotator==nil(dev 兜底证书)/ 无 cred 不启——降级仅靠短 TTL 兜底,权威在 PoP。
+	// 两条续期链独立(§3.6.1):证书续期 RunRenewLoop→/renew(24h)vs 凭证刷新 runCredRefreshLoop→/session/refresh(30min)。
+	if d.cfg.EnrollMode == EnrollModeIDP && rotator != nil && d.creds.Token() != "" {
+		hc := mTLSHTTPClient(tlsConf) // 出示设备证书(GetClientCertificate 走 rotator,热轮换)
+		go d.runCredRefreshLoop(ctx, d.creds, hc, d.cfg.CredRefreshURL, d.cfg.RefreshLead, d.reconnect)
 	}
 
 	// 会话状态 + 实时通道(复用 agent.Session;收 revoke/recheck_posture/reauth)。
@@ -341,10 +382,11 @@ func (d *Daemon) runTunnelOnce(ctx context.Context, tlsConf *tls.Config) error {
 	}
 
 	// 握手(复用 tunhandshake.DialWithCred:互认证 TLS1.3 + RFC5705 派生 dptunnel.Session;防降级校验 alg)。
-	// **ZTNA 形态(Slice77)**:携会话凭证 SessionTok → PoP 终结器(ZTNA_TUNNEL_ADDR)经 verifyCred hook
-	// 验签 + 交叉核对租户 + 查吊销,验过的 principal(组/姿态/风险)供逐流 PEP。SessionTok 空(未配)时
+	// **ZTNA 形态(Slice77)**:携会话凭证 → PoP 终结器(ZTNA_TUNNEL_ADDR)经 verifyCred hook
+	// 验签 + 交叉核对租户 + 查吊销,验过的 principal(组/姿态/风险)供逐流 PEP。凭证空(未配)时
 	// 等价裸 Dial(连 SD-WAN 形态 PoP 不验 cred,行为不变)。
-	res, err := tunhandshake.DialWithCred(ctx, pop.HandshakeAddr, tlsConf, d.cfg.Alg, advAddr, d.cfg.Tenant, d.cfg.Identity, d.cfg.SessionTok)
+	// **Slice81**:从 credStore 取**最新**凭证(每轮重连用刷新后的 cred;刷新成功会经 reconnect 触发本方法返回重连)。
+	res, err := tunhandshake.DialWithCred(ctx, pop.HandshakeAddr, tlsConf, d.cfg.Alg, advAddr, d.cfg.Tenant, d.cfg.Identity, d.creds.Token())
 	if err != nil {
 		return fmt.Errorf("握手 PoP %s: %w", pop.Name, err)
 	}
@@ -378,8 +420,23 @@ func (d *Daemon) runTunnelOnce(ctx context.Context, tlsConf *tls.Config) error {
 	tunCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	d.setState(StateRunning)
-	dptunnel.NewEndpoint(tunSess, pio, dataConn, res.PoPDataAddr).Run(tunCtx)
-	return fmt.Errorf("数据面 pump 退出(隧道断/ctx 取消)")
+	// pump 在子 goroutine 跑;主 goroutine select pump 完成 / 凭证刷新重握手信号 / ctx 取消。
+	// **Slice81 主动重握手**:刷新成功 → d.reconnect 信号 → cancel 本轮 tunCtx(pump 退出)→ 返回 →
+	// retryLoop 用新 cred 重连。第一刀「有界小 gap」(非 make-before-break;gap≈握手时间,TCP 重传兜底)。
+	pumpDone := make(chan struct{})
+	go func() {
+		dptunnel.NewEndpoint(tunSess, pio, dataConn, res.PoPDataAddr).Run(tunCtx)
+		close(pumpDone)
+	}()
+	select {
+	case <-pumpDone:
+		return fmt.Errorf("数据面 pump 退出(隧道断/ctx 取消)")
+	case <-d.reconnect:
+		cancel()   // 停本轮 pump(tunCtx 取消 → Endpoint.Run 退出)
+		<-pumpDone // 等 pump 干净退出再返回(避免 dataConn/pio 在 defer 关闭时仍被 pump 用)
+		log.Printf("[agentd] 会话凭证已刷新,主动重握手")
+		return fmt.Errorf("会话凭证刷新触发重握手")
+	}
 }
 
 // startControlChannel 起实时通道客户端(复用 agent.Session.RunControlChannel,收 revoke/recheck/reauth)。
@@ -392,13 +449,14 @@ func (d *Daemon) runTunnelOnce(ctx context.Context, tlsConf *tls.Config) error {
 //     秒级本地阻断「端提速」(ZTNA 硬化 L2 §3.4 层②)本刀为空转,权威仍靠 PoP + 短 TTL 兜底(后续刀)。
 //   - reauth:既有件仅 log,daemon 未重走令牌交换(LZ11,后续刀)。
 func (d *Daemon) startControlChannel(ctx context.Context, sess *agent.Session, tlsConf *tls.Config) {
-	if d.cfg.ControlAddr == "" || d.cfg.SessionTok == "" {
-		log.Printf("[agentd] 未配实时通道(ControlAddr/SessionTok),撤销仅靠短 TTL 兜底(权威在 PoP)")
+	if d.cfg.ControlAddr == "" || d.creds.Token() == "" {
+		log.Printf("[agentd] 未配实时通道(ControlAddr/凭证),撤销仅靠短 TTL 兜底(权威在 PoP)")
 		return
 	}
 	go func() {
 		for ctx.Err() == nil {
-			err := sess.RunControlChannel(ctx, d.cfg.ControlAddr, tlsConf, d.cfg.SessionTok)
+			// 取最新凭证(刷新后重连用新 token;Hub verifier 对刷新签发的新 token 同样可验)。
+			err := sess.RunControlChannel(ctx, d.cfg.ControlAddr, tlsConf, d.creds.Token())
 			if ctx.Err() != nil {
 				return
 			}

@@ -76,6 +76,7 @@ func runDaemon() error {
 		ControlAddr:     os.Getenv("CONTROL_ADDR"),
 		SessionTok:      os.Getenv("SESSION_TOKEN"),
 		SessionJTI:      os.Getenv("SESSION_JTI"),
+		CredRefreshURL:  os.Getenv("CRED_REFRESH_URL"), // 空=用 DeviceURL(:8444 设备面,同续期端点)
 		AgentVersion:    agentVersion,
 	}
 

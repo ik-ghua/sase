@@ -22,6 +22,7 @@ import (
 	"github.com/ikuai8/sase/internal/audit"
 	"github.com/ikuai8/sase/internal/authz"
 	"github.com/ikuai8/sase/internal/cred"
+	"github.com/ikuai8/sase/internal/credrefresh"
 	"github.com/ikuai8/sase/internal/csrf"
 	"github.com/ikuai8/sase/internal/devpki"
 	"github.com/ikuai8/sase/internal/dlp"
@@ -1083,11 +1084,87 @@ func listDevices(svc enroll.Service) http.HandlerFunc {
 	}
 }
 
-// RegisterDevice 在 mTLS 设备端点 mux 上挂 ZTP 续期。须由 RequireAndVerifyClientCert 的 server 承载:
-// tenant/identity 取自已校验的对端证书(非请求体),设备无法借此续成他租户/他身份。无 admin RBAC。
-// 按来源 IP 限流(纵深:即便持合法证书也限制续期频率)。
-func RegisterDevice(mux *http.ServeMux, enrollSvc enroll.Service, renewLimiter *ratelimit.Limiter) {
+// RegisterDevice 在 mTLS 设备端点 mux 上挂 ZTP 续期 + Agent 会话凭证刷新(Slice81)。须由
+// RequireAndVerifyClientCert 的 server 承载:tenant/identity 取自已校验的对端证书(非请求体),设备无法借此
+// 续成他租户/他身份。无 admin RBAC。按来源 IP 限流(纵深:即便持合法证书也限制频率)。
+//
+// refreshSvc nil(测试/未配置)→ 刷新端点返 503(端点存在,守路由形态,同 agentEnroll/oidcDeps);
+// refreshLimiter rate 略高于 renewLimiter(cred 刷新远比证书续期频繁,§3.6.1 TTL 30min vs 24h)。
+func RegisterDevice(mux *http.ServeMux, enrollSvc enroll.Service, renewLimiter *ratelimit.Limiter,
+	refreshSvc *credrefresh.Service, refreshLimiter *ratelimit.Limiter) {
 	mux.Handle("POST /api/v1/renew", ratelimit.Wrap(renewLimiter, ratelimit.ClientIP, renewDevice(enrollSvc)))
+	mux.Handle("POST /api/v1/agent/session/refresh", ratelimit.Wrap(refreshLimiter, ratelimit.ClientIP, agentSessionRefresh(refreshSvc)))
+}
+
+// agentSessionRefresh 是真 OS 级 ZTNA Agent 的会话凭证静默刷新端点(Slice81,§3.6.1)。:8444 设备面,与
+// /renew 同 mTLS 模型(出示当前租户绑定设备证书 role:device,tenant/device-id 取自已校验证书,非请求体)。
+//
+// 认证 = **设备 mTLS(transport)+ 出示当前签名 cred(app 层,经 svc.Refresh 验签)** 双重,免重新 IdP 登录。
+// body 仅 {current_cred_token, posture}(**无 groups**:重签 groups 唯一来源是验签 cred,防 body 提权,§3.6.1)。
+// 错误分流:cred 无效/主体不符→401,设备撤销/用户停用→403,参数错→400,内部错→500 脱敏(log 保细节)。
+// refreshSvc nil → 503(端点存在但未配置)。
+func agentSessionRefresh(svc *credrefresh.Service) http.HandlerFunc {
+	type reqBody struct {
+		CurrentCredToken string `json:"current_cred_token"`
+		Posture          string `json:"posture"`
+	}
+	if svc == nil {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "Agent 会话刷新未配置", http.StatusServiceUnavailable)
+		}
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+			http.Error(w, "client cert required", http.StatusUnauthorized)
+			return
+		}
+		cert := r.TLS.PeerCertificates[0] // 已由 server mTLS(本 CA)校验
+		tenant, ok := devpki.TenantFromCert(cert)
+		if !ok || cert.Subject.CommonName == "" {
+			http.Error(w, "cert without tenant/identity", http.StatusForbidden)
+			return
+		}
+		// 纵深:刷新端点专供 role:device 设备(Agent 的租户绑定证书);非 device 角色(如 role:pop)拒。
+		if role, rok := devpki.RoleFromCert(cert); !rok || role != devpki.RoleDevice {
+			http.Error(w, "device role required", http.StatusForbidden)
+			return
+		}
+		// body 上限(同 /agent/enroll 的 R1):收 cred token + posture,均小,1 MiB 宽裕。
+		r.Body = http.MaxBytesReader(w, r.Body, maxLoginBodyBytes)
+		var body reqBody
+		if !decode(w, r, &body) {
+			return
+		}
+		res, err := svc.Refresh(r.Context(), credrefresh.Request{
+			TenantID:         tenant,                  // 取自证书 Org(权威)
+			DeviceID:         cert.Subject.CommonName, // 取自证书 CN(权威)
+			CurrentCredToken: body.CurrentCredToken,   // 待验签(提取 subject + groups)
+			Posture:          body.Posture,            // 来自请求体(姿态非唯一门禁)
+		})
+		switch {
+		case errors.Is(err, credrefresh.ErrBadRequest):
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		case errors.Is(err, credrefresh.ErrCredInvalid), errors.Is(err, credrefresh.ErrSubjectMismatch):
+			// 凭证无效/主体不符:401(不区分细节,设备据此重走 IdP 入网)。
+			http.Error(w, "credential invalid", http.StatusUnauthorized)
+			return
+		case errors.Is(err, credrefresh.ErrDeviceRevoked), errors.Is(err, credrefresh.ErrUserDisabled):
+			http.Error(w, "device or user not active", http.StatusForbidden)
+			return
+		case err != nil:
+			// 内部错(DB/吊销表/签发):脱敏(log 保细节,响应仅通用文案)。
+			log.Printf("[device] agentSessionRefresh tenant=%s device=%s 内部错误: %v", tenant, cert.Subject.CommonName, err)
+			http.Error(w, "session refresh failed", http.StatusInternalServerError)
+			return
+		}
+		// 成功:仅返回新会话凭证 + jti + 有效期(不含任何敏感配置)。
+		writeJSON(w, http.StatusOK, map[string]any{
+			"session_token": res.SessionToken,
+			"session_jti":   res.SessionJTI,
+			"expires_in":    res.ExpiresIn,
+		})
+	}
 }
 
 func renewDevice(svc enroll.Service) http.HandlerFunc {

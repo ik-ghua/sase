@@ -64,7 +64,14 @@ type Service interface {
 	RevokeDevice(ctx context.Context, tenantID, identity string) error
 	// ListDevices 列出该租户已登记设备(ZTP 可见性)。经 InTxRO 走 RLS,只返回**非敏感**列(不含激活码)。
 	ListDevices(ctx context.Context, tenantID string) ([]Device, error)
+	// LookupAgentUser 按 (tenant, deviceID=证书 CN, kind='agent') 取设备入网记录的关联用户与状态(Slice81 §3.6.1)。
+	// 经 InTxRO(RLS):返回 device_enrollments.user_id(NULL → 返空 userID)与 status(redeemed/revoked)。
+	// 供会话凭证刷新的 device↔user 交叉核对 + 设备未撤销门禁。设备不存在返 ErrAgentDeviceNotFound。
+	LookupAgentUser(ctx context.Context, tenantID, deviceID string) (userID, deviceStatus string, err error)
 }
+
+// ErrAgentDeviceNotFound 表示按 (tenant, deviceID, kind='agent') 查不到 Agent 设备入网记录(供刷新路径分流)。
+var ErrAgentDeviceNotFound = errors.New("enroll: Agent 设备入网记录不存在")
 
 // AuditFunc 记录 ZTP 证书签发/续期事件(设备认证、非 admin principal,故不经 admin 审计中间件,单独记)。
 // 解耦:用函数型钩子而非依赖 audit 包。result 为 HTTP 状态码语义(200=成功)。
@@ -308,4 +315,35 @@ func (s *service) ListDevices(ctx context.Context, tenantID string) ([]Device, e
 		out = []Device{}
 	}
 	return out, nil
+}
+
+// LookupAgentUser 见接口注释。经 InTxRO(RLS,只读 app_ro),按 identity(=证书 CN)+ kind='agent' 取记录。
+// user_id 为 NULL(Connector/CPE 或未关联)→ 返回空 userID(调用方据此拒刷新,§3.6.1 三闸 user_id 非空)。
+// RLS 保证跨租户 deviceID 不可见 → ErrAgentDeviceNotFound(同 GetUserStatus 跨租户语义)。
+func (s *service) LookupAgentUser(ctx context.Context, tenantID, deviceID string) (string, string, error) {
+	if tenantID == "" || deviceID == "" {
+		return "", "", errors.New("enroll.LookupAgentUser: tenant/device_id 必填")
+	}
+	var userID *string // user_id 可空(NULL → 空 userID)
+	var deviceStatus string
+	err := s.store.InTxRO(ctx, tenantID, func(q data.Queries) error {
+		row := q.QueryRow(ctx,
+			`SELECT user_id, status FROM device_enrollments
+			 WHERE identity = $1 AND kind = 'agent' LIMIT 1`, deviceID)
+		if scanErr := row.Scan(&userID, &deviceStatus); scanErr != nil {
+			if errors.Is(scanErr, data.ErrNoRows) {
+				return ErrAgentDeviceNotFound
+			}
+			return fmt.Errorf("enroll.LookupAgentUser scan: %w", scanErr)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", "", err
+	}
+	uid := ""
+	if userID != nil {
+		uid = *userID
+	}
+	return uid, deviceStatus, nil
 }

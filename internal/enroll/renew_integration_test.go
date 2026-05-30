@@ -58,7 +58,7 @@ func TestZTPRenewAndRevoke(t *testing.T) {
 		t.Fatalf("ServerTLS: %v", err)
 	}
 	mux := http.NewServeMux()
-	httpapi.RegisterDevice(mux, svc, nil) // nil 限流器=不限流(测试)
+	httpapi.RegisterDevice(mux, svc, nil, nil, nil) // nil 限流器=不限流;nil refreshSvc=刷新端点 503(本测试不验刷新)
 	dev := httptest.NewUnstartedServer(mux)
 	dev.TLS = srvTLS
 	dev.StartTLS()

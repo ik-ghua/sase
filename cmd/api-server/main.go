@@ -28,6 +28,7 @@ import (
 	"github.com/ikuai8/sase/internal/authz"
 	"github.com/ikuai8/sase/internal/control"
 	"github.com/ikuai8/sase/internal/cred"
+	"github.com/ikuai8/sase/internal/credrefresh"
 	"github.com/ikuai8/sase/internal/data"
 	"github.com/ikuai8/sase/internal/devpki"
 	"github.com/ikuai8/sase/internal/dlp"
@@ -158,10 +159,12 @@ func run() error {
 		}))
 
 	// ZTP 公开/设备端点限流(防激活码枚举/续期暴力):按来源 IP 令牌桶,janitor 淘汰空闲桶。
-	enrollLimiter := ratelimit.New(0.2, 5) // 兑换:稳态 1/5s、突发 5(单 IP)
-	renewLimiter := ratelimit.New(0.1, 3)  // 续期:更低频(正常每设备数小时一次)
+	enrollLimiter := ratelimit.New(0.2, 5)   // 兑换:稳态 1/5s、突发 5(单 IP)
+	renewLimiter := ratelimit.New(0.1, 3)    // 续期:更低频(正常每设备数小时一次)
+	refreshLimiter := ratelimit.New(0.5, 10) // 会话凭证刷新:略高于续期(cred TTL 30min 远比证书 24h 频繁,§3.6.1)
 	enrollLimiter.StartJanitor(ctx, 10*time.Minute, 30*time.Minute)
 	renewLimiter.StartJanitor(ctx, 10*time.Minute, 30*time.Minute)
+	refreshLimiter.StartJanitor(ctx, 10*time.Minute, 30*time.Minute)
 
 	// 平台跨租户只读(InPlatformTx,需 SASE_DB_PLATFORM_DSN 配 app_platform_ro)+ 注入 sweep 依赖
 	// (适配器把 secret.Service / tenant.Service 的接口收窄到 platform 期望的 narrow interface,避免平台→业务硬依赖)。
@@ -259,7 +262,9 @@ func run() error {
 			return fmt.Errorf("加载设备端点 mTLS: %w", derr)
 		}
 		devMux := http.NewServeMux()
-		httpapi.RegisterDevice(devMux, enrollSvc, renewLimiter)
+		// Slice81:真 OS 级 ZTNA Agent 会话凭证刷新编排(复用 enrollSvc/identitySvc/verifier;同 :8444 设备 mTLS)。
+		credRefreshSvc := buildCredRefreshDeps(enrollSvc, identitySvc, verifier)
+		httpapi.RegisterDevice(devMux, enrollSvc, renewLimiter, credRefreshSvc, refreshLimiter)
 		// Slice60 待后续②:设备面 :8444 HTTP RED 指标。device recorder 用 sase_device_* 指标名
 		// 区分管理面 sase_api_*;route 取注册的 mux 路由模板(devMux.Handler(r) → 如 "POST /api/v1/renew")
 		// **不打真实路径/设备 ID/tenant 等高基数标签**(严守 Slice60 基数控制)。
@@ -462,6 +467,23 @@ func buildAgentEnrollDeps(idpSvc idp.Service, identitySvc identity.Service, enro
 		Issuer:  identitySvc,
 		Enroll:  enrollSvc,
 		Factory: oidc.DispatchFactory,
+	})
+}
+
+// buildCredRefreshDeps 装配真 OS 级 ZTNA Agent 会话凭证刷新编排(Slice81,L2 §3.6.1):
+// 复用既有 enrollSvc(LookupAgentUser 查设备↔用户关联)、identitySvc(GetUserStatus + IssueCredential 重签 +
+// IsRevoked 纵深查吊销表)、verifier(验当前 cred 签名提取 subject+groups,与签发器同密钥)。
+//
+// **groups 防提权**:重签的 groups 来自 verifier 验签的当前 cred(控制面自己签的,可信),绝不取客户端 body
+// 自报(§3.6.1 铁律,编排在 credrefresh.Service 内强制)。
+// 注:identity.Service 同时满足 UserStatusSvc(GetUserStatus)、CredIssuer(IssueCredential)、RevocationChecker(IsRevoked)。
+func buildCredRefreshDeps(enrollSvc enroll.Service, identitySvc identity.Service, verifier *cred.Verifier) *credrefresh.Service {
+	return credrefresh.New(credrefresh.Config{
+		Verifier: verifier,
+		Enroll:   enrollSvc,
+		Users:    identitySvc,
+		Issuer:   identitySvc,
+		RevChk:   identitySvc, // 纵深:刷新前校 jti 未在吊销表(防 EvictRevoked 拆的会话靠刷新复活)
 	})
 }
 
