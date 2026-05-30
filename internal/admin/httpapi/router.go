@@ -18,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/ikuai8/sase/internal/agentenroll"
 	"github.com/ikuai8/sase/internal/audit"
 	"github.com/ikuai8/sase/internal/authz"
 	"github.com/ikuai8/sase/internal/cred"
@@ -113,6 +114,8 @@ var AdminRoutePatterns = []string{
 	"DELETE /api/v1/platform/admins/{aid}",
 	"GET /api/v1/trust/pubkey",
 	"POST /api/v1/enroll",
+	// 真 OS 级 ZTNA Agent per-user 入网(Slice80;公开端点 = IdP token 引导信任,authz 白名单 + CSRF skip + IP 限流)
+	"POST /api/v1/agent/enroll",
 	// IdP OIDC 登录入口/回调(Slice37a;authz 已放行,未认证用户经 IdP 换发 SASE 会话凭证)
 	"GET /api/v1/idp/login",
 	"GET /api/v1/idp/callback",
@@ -122,8 +125,8 @@ var AdminRoutePatterns = []string{
 }
 
 // Register 装配 Admin API 路由。
-// oidcDeps / popReg / platformAuditSvc / platformRBAC / riskSvc 均可为 nil(测试/无 PLATFORM_RW DSN):对应端点返 503(端点仍在,守住路由清单)。
-func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity.Service, policySvc policy.Service, resourceSvc resource.Service, auditSvc audit.Service, swgSvc swg.Service, siteSvc site.Service, fwSvc fw.Service, dlpSvc dlp.Service, enrollSvc enroll.Service, platformSvc platform.Service, popReg platform.PopRegistry, platformAuditSvc platformaudit.Service, platformRBAC platformrbac.Service, idpSvc idp.Service, oidcDeps *oidc.HandlerDeps, enrollLimiter *ratelimit.Limiter, verifier *cred.Verifier, adminActiveChecker authz.AdminActiveChecker, apiRec *metrics.APIRecorder, riskSvc *risk.Service) {
+// oidcDeps / agentEnrollSvc / popReg / platformAuditSvc / platformRBAC / riskSvc 均可为 nil(测试/无 PLATFORM_RW DSN):对应端点返 503(端点仍在,守住路由清单)。
+func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity.Service, policySvc policy.Service, resourceSvc resource.Service, auditSvc audit.Service, swgSvc swg.Service, siteSvc site.Service, fwSvc fw.Service, dlpSvc dlp.Service, enrollSvc enroll.Service, platformSvc platform.Service, popReg platform.PopRegistry, platformAuditSvc platformaudit.Service, platformRBAC platformrbac.Service, idpSvc idp.Service, oidcDeps *oidc.HandlerDeps, agentEnrollSvc *agentenroll.Service, enrollLimiter *ratelimit.Limiter, verifier *cred.Verifier, adminActiveChecker authz.AdminActiveChecker, apiRec *metrics.APIRecorder, riskSvc *risk.Service) {
 	// 路由表(pattern → handler);键须与 AdminRoutePatterns 完全一致(下方 assert 守)。
 	handlers := map[string]http.Handler{
 		"POST /api/v1/tenants":                          createTenant(tenantSvc),
@@ -196,6 +199,9 @@ func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity
 		"GET /api/v1/trust/pubkey":             trustPubkey(identitySvc),
 		// ZTP 兑换:公开(设备凭激活码),authz 中已放行;路径不带 {tid}(租户由激活码前缀解析)。公开端点按来源 IP 限流,防枚举/暴力。
 		"POST /api/v1/enroll": ratelimit.Wrap(enrollLimiter, ratelimit.ClientIP, redeemEnrollment(enrollSvc)),
+		// 真 OS 级 ZTNA Agent per-user 入网(Slice80):公开端点(引导态无 mTLS/cred,信任来自 IdP token),
+		// authz 白名单 + CSRF skip + 复用 /enroll 的 IP 限流防枚举;agentEnrollSvc nil → 503(守路由清单,同 oidcDeps)。
+		"POST /api/v1/agent/enroll": ratelimit.Wrap(enrollLimiter, ratelimit.ClientIP, agentEnroll(agentEnrollSvc)),
 		// IdP OIDC 登录/回调:authz 已放行未认证;oidcDeps nil 时返 503(便兼容无 OIDC 部署 + 测试 nil 注入)
 		"GET /api/v1/idp/login":    oidcLogin(oidcDeps),
 		"GET /api/v1/idp/callback": oidcCallback(oidcDeps),
@@ -219,6 +225,7 @@ func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity
 		AllowedOrigins: csrfAllowedOriginsFromEnv(),
 		Skip: map[string]bool{
 			"/api/v1/enroll":       true, // 设备端点(非浏览器,无 cookie)
+			"/api/v1/agent/enroll": true, // Agent 引导入网(非浏览器/无 cookie;信任来自 IdP token,Slice80)
 			"/api/v1/idp/login":    true, // GET 跳 IdP;白名单避免冗余颁发(GET 本身不校验)
 			"/api/v1/idp/callback": true, // GET IdP→服务端跳转
 			"/api/v1/trust/pubkey": true, // 公开只读
@@ -1129,6 +1136,78 @@ func redeemEnrollment(svc enroll.Service) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"cert_pem": string(certPEM)})
+	}
+}
+
+// agentEnroll 是真 OS 级 ZTNA Agent 的 per-user 入网编排端点(Slice80,L2 §3.10.1)。公开端点
+// (引导态无 mTLS/cred;authz 白名单 + CSRF skip + IP 限流);信任来自请求体 IdP code(控制面 adapter.Exchange
+// 验签 id_token + 校 PKCE)+ code/state 一次性。daemon 本地生成 device key+CSR(私钥不离设备)、本地 PKCE
+// verifier(随 code 交换)。**响应不含 client_secret/私钥**;session_token 是会话凭证,明示。
+//
+// agentEnrollSvc nil(测试/无 OIDC 配置)→ 503(端点存在但未配置,守路由清单,同 oidcDeps)。
+// 错误分流:IdP 配置错→404、IdP 认证失败→401、用户停用→403、参数错→400、内部错→500 脱敏(log 保细节)。
+func agentEnroll(svc *agentenroll.Service) http.HandlerFunc {
+	type reqBody struct {
+		Code         string `json:"code"`
+		CodeVerifier string `json:"code_verifier"`
+		RedirectURI  string `json:"redirect_uri"`
+		TenantID     string `json:"tenant_id"`
+		IDPID        string `json:"idp_id"`
+		DeviceID     string `json:"device_id"`
+		CSRPem       string `json:"csr_pem"`
+		Posture      string `json:"posture"`
+	}
+	if svc == nil {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "Agent 入网未配置(需 OIDC 依赖)", http.StatusServiceUnavailable)
+		}
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		// body 上限(Slice80 reviewer S1):/agent/enroll 是未认证公开端点(引导态)且收 CSR PEM,
+		// 经 MaxBytesReader 收敛防异常超大 body 内存放大(同 /login 的 R1)。CSR PEM 仅数 KB,1 MiB 宽裕。
+		r.Body = http.MaxBytesReader(w, r.Body, maxLoginBodyBytes)
+		var body reqBody
+		if !decode(w, r, &body) {
+			return
+		}
+		res, err := svc.Enroll(r.Context(), agentenroll.Request{
+			Code:         body.Code,
+			CodeVerifier: body.CodeVerifier,
+			RedirectURI:  body.RedirectURI,
+			TenantID:     body.TenantID,
+			IDPID:        body.IDPID,
+			DeviceID:     body.DeviceID,
+			CSRPem:       []byte(body.CSRPem),
+			Posture:      body.Posture,
+		})
+		switch {
+		case errors.Is(err, agentenroll.ErrBadRequest):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		case errors.Is(err, agentenroll.ErrIDPConfig):
+			// IdP 配置不存在/禁用:统一 404(不区分以免泄露存在性)。
+			http.Error(w, "IdP 配置不可用", http.StatusNotFound)
+			return
+		case errors.Is(err, agentenroll.ErrIDPAuth):
+			http.Error(w, "IdP 认证失败", http.StatusUnauthorized)
+			return
+		case errors.Is(err, agentenroll.ErrUserDisabled):
+			http.Error(w, "用户已停用", http.StatusForbidden)
+			return
+		case err != nil:
+			// 内部错(DB/secret/签发):脱敏(log 保细节,响应仅通用文案,防泄露 DB/IdP URL 等)。
+			log.Printf("[admin] agentEnroll tenant=%s idp=%s device=%s 内部错误: %v", body.TenantID, body.IDPID, body.DeviceID, err)
+			http.Error(w, "Agent 入网失败", http.StatusInternalServerError)
+			return
+		}
+		// 成功:响应不含 client_secret/私钥;cert_pem 为租户绑定设备证书,session_token 为会话凭证。
+		writeJSON(w, http.StatusOK, map[string]any{
+			"cert_pem":      string(res.CertPEM),
+			"session_token": res.SessionToken,
+			"session_jti":   res.SessionJTI,
+			"expires_in":    res.ExpiresIn,
+			"user_id":       res.UserID,
+		})
 	}
 }
 

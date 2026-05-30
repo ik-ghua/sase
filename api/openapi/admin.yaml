@@ -583,6 +583,31 @@ paths:
         '200': { description: 已签发证书, content: { application/json: { schema: { $ref: '#/components/schemas/RedeemResponse' } } } }
         '429': { description: 限流(激活码枚举/暴力防护) }
 
+  /api/v1/agent/enroll:
+    post:
+      tags: [enrollment]
+      summary: 真 OS 级 ZTNA Agent per-user 入网(公开;IdP code + 设备 CSR → 租户绑定证书 + per-user 会话凭证)
+      description: |
+        Slice80(L2 §3.10.1)。Agent daemon 经 loopback redirect + PKCE 拿到 IdP 授权码后调用此端点;
+        **控制面持 client_secret 完成令牌交换**(adapter.Exchange 验 id_token 签名 + 校 PKCE),client_secret 永不下发设备。
+        编排:Exchange(code+verifier→UserInfo) → EnsureUser(status=active 闸) → enroll.RedeemAgent 签设备证书
+        → identity.IssueCredential 签 per-user 会话凭证。**cert↔cred 双绑定**:同一 user.ID 用于设备入网账本
+        user_id 与会话凭证 Subject。
+        **公开端点**(引导态无 mTLS/无 cred;authz 白名单 + CSRF skip + 按 IP 限流);信任来自 IdP id_token + PKCE + code 一次性。
+        **响应不含 client_secret/私钥**(私钥本地生成永不离设备);session_token 是会话凭证(明示)。
+        agentEnrollSvc 未配置(无 OIDC 依赖)→ 503。
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AgentEnrollRequest' } } } }
+      responses:
+        '200': { description: 已签发设备证书 + 会话凭证, content: { application/json: { schema: { $ref: '#/components/schemas/AgentEnrollResponse' } } } }
+        '400': { description: 参数缺失/非法(code/verifier/redirect_uri/tenant_id/idp_id/device_id/csr_pem) }
+        '401': { description: IdP 认证失败(id_token 校验/PKCE/code 无效) }
+        '403': { description: 用户已停用(管理员手动 disabled) }
+        '404': { description: IdP 配置不可用(不存在/已禁用) }
+        '429': { description: 限流(防枚举) }
+        '500': { description: 内部错误(脱敏) }
+        '503': { description: Agent 入网未配置(无 OIDC 依赖) }
+
   /api/v1/idp/login:
     get:
       tags: [oidc]
@@ -1004,6 +1029,31 @@ components:
       type: object
       properties:
         cert_pem: { type: string, description: 租户绑定证书(PEM) }
+
+    AgentEnrollRequest:
+      type: object
+      description: 真 OS 级 ZTNA Agent per-user 入网请求(Slice80;daemon 经 loopback+PKCE 拿到 IdP code 后提交)。
+      properties:
+        code:          { type: string, description: IdP 回的授权码(一次性) }
+        code_verifier: { type: string, description: PKCE code_verifier(daemon 持有;控制面据此换 token,防 code 截获) }
+        redirect_uri:  { type: string, description: 入网使用的 daemon loopback redirect_uri(须与 IdP authorize 一致) }
+        tenant_id:     { type: string, format: uuid }
+        idp_id:        { type: string, format: uuid, description: IdPConfig ID }
+        device_id:     { type: string, description: 设备身份(=证书 CN;daemon 本地稳定随机 UUID,与私钥同源) }
+        csr_pem:       { type: string, description: 设备本地生成的 CSR(PEM;**私钥不离设备**) }
+        posture:       { type: string, description: 入网时姿态摘要(可空;填入会话凭证 posture claim) }
+      required: [code, code_verifier, redirect_uri, tenant_id, idp_id, device_id, csr_pem]
+    AgentEnrollResponse:
+      type: object
+      description: |
+        入网成功返回。**不含 client_secret/私钥**(私钥本地生成永不离设备;client_secret 仅控制面短窗内存)。
+        session_token 是 per-user 短 TTL 会话凭证(明示;Subject=SASE user.ID、Groups=IdP 组,供 PoP PEP)。
+      properties:
+        cert_pem:      { type: string, description: 租户绑定设备证书(PEM;Org=tenant、CN=device_id、role:device) }
+        session_token: { type: string, description: per-user 会话凭证(供 PoP 终结器 PEP;Subject=user.ID) }
+        session_jti:   { type: string, description: 会话凭证 jti(撤销匹配用) }
+        expires_in:    { type: integer, description: 会话凭证有效期(秒) }
+        user_id:       { type: string, format: uuid, description: SASE 用户 ID(=设备入网账本 user_id;cert↔cred 双绑定) }
 
     PoP:
       type: object

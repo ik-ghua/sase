@@ -41,3 +41,9 @@ type unsupportedSystemIntegration struct{}
 
 func (unsupportedSystemIntegration) Notify(string, string) error { return nil }
 func (unsupportedSystemIntegration) Autostart(bool) error        { return nil }
+
+// OpenBrowser 在非 Linux/darwin 平台(Windows wintun 壳为后续刀,L2 §4)返错:daemon 降级打印 url
+// 让用户手动打开(headless 友好)。Windows 真集成(rundll32 url.dll,FileProtocolHandler)= 后续刀。
+func (unsupportedSystemIntegration) OpenBrowser(url string) error {
+	return fmt.Errorf("agentd: 当前平台暂无 OpenBrowser 壳,请手动打开: %s", url)
+}

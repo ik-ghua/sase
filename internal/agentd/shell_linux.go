@@ -200,6 +200,17 @@ func (linuxSystemIntegration) Autostart(enable bool) error {
 	return nil
 }
 
+// OpenBrowser 用 xdg-open 拉起系统默认浏览器(IdP 入网,Slice80)。无 GUI/无 xdg-open → 返错(daemon 降级打印 url)。
+func (linuxSystemIntegration) OpenBrowser(url string) error {
+	if _, err := exec.LookPath("xdg-open"); err != nil {
+		return fmt.Errorf("agentd/linux: 无 xdg-open(无 GUI?),请手动打开: %s", url)
+	}
+	if err := exec.Command("xdg-open", url).Start(); err != nil {
+		return fmt.Errorf("agentd/linux: xdg-open 失败: %w", err)
+	}
+	return nil
+}
+
 // NewPlatformShells 是 cmd/agent 装配 Linux 三窄壳的便捷构造(平台壳工厂,跨平台同名;macOS 见
 // shell_darwin.go、非 Linux/darwin 见 shell_other.go)。
 func NewPlatformShells(tunName string, mtu int) (NetCapture, PostureProbe, SystemIntegration) {

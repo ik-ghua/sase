@@ -31,12 +31,24 @@ const (
 	StateStopped   State = "stopped"    // ctx 取消,已退出
 )
 
+// EnrollMode 选入网方式(Slice80)。
+const (
+	EnrollModeZTP = "ztp" // 激活码 ZTP(默认;Connector/CPE/现有 demo;enroll.DeviceTLS)
+	EnrollModeIDP = "idp" // 真 OS 级 ZTNA Agent per-user IdP 入网(loopback + PKCE + /agent/enroll 编排)
+)
+
 // Config 是守护进程装配配置(对齐 cmd/cpe 的 env 风格;由 cmd/agent 从 env 注入)。
 type Config struct {
-	// 身份与入网(复用激活码 ZTP;IdP 用户认证入网 = LZ11 后续刀)
+	// 身份与入网(ztp=激活码;idp=IdP 用户认证,Slice80 LZ11 定夺)
 	Tenant   string // 租户 UUID(本端身份;权威以证书 Org 为准,与 site/identity 交叉核对)
-	Identity string // 设备身份(证书 CN;Agent 形态可为 device id / user@device,本刀由配置给)
-	ZTPCode  string // 激活码(非空走 ZTP 取租户绑定证书;空则用 dev 共享 role:device 证书兜底)
+	Identity string // 设备身份(证书 CN;Agent 形态 = 本地稳定随机 device-id,本刀由配置给)
+	ZTPCode  string // 激活码(ztp 模式:非空走 ZTP 取租户绑定证书;空则用 dev 共享 role:device 证书兜底)
+
+	// IdP 入网(EnrollMode=idp,Slice80;ztp 模式忽略)
+	EnrollMode      string // "ztp"(默认)| "idp";idp 走 loopback + PKCE + /agent/enroll 编排
+	IDPID           string // IdPConfig ID(idp 模式必填)
+	AgentEnrollURL  string // 管理面 /api/v1/agent/enroll 绝对 URL(idp 模式必填)
+	IDPAuthorizeURL string // IdP authorize 端点 + client_id + scope 的公开 URL(idp 模式;daemon 据此拼 loopback+PKCE)
 
 	// 端点地址(去硬编码:PoP 候选由 SetCandidates 注入,本配置给入网/管理面地址)
 	MgmtURL    string // 管理面 HTTPS(入网 /enroll)
@@ -64,6 +76,9 @@ type Config struct {
 }
 
 func (c *Config) withDefaults() {
+	if c.EnrollMode == "" {
+		c.EnrollMode = EnrollModeZTP // 向后兼容:默认激活码 ZTP(Connector/CPE/现有 demo 不破)
+	}
 	if c.Alg == "" {
 		c.Alg = dptunnel.AlgChaCha20Poly1305
 	}
@@ -184,7 +199,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return fmt.Errorf("agentd: 未提供 NetCapture 壳(平台不支持?)")
 	}
 
-	// 入网:取租户绑定证书 + 续期循环(复用 enroll.DeviceTLS / RunRenewLoop)。
+	// EnrollMode=idp(Slice80):IdP 用户认证 per-user 入网(loopback + PKCE + /agent/enroll 编排)。
+	// 取得设备证书 + per-user 会话凭证(填运行态),再进 runWithCert(其余阶段与 ztp 完全一致)。
+	if d.cfg.EnrollMode == EnrollModeIDP {
+		return d.runIDPMode(ctx)
+	}
+
+	// EnrollMode=ztp(默认,向后兼容):激活码 ZTP 取租户绑定证书 + 续期循环(复用 enroll.DeviceTLS / RunRenewLoop)。
 	d.setState(StateEnrolling)
 	tlsConf, rotator, err := enroll.DeviceTLS(ctx, d.cfg.TLSDir, d.cfg.MgmtURL, d.cfg.ServerName, d.cfg.ZTPCode, d.cfg.Identity)
 	if err != nil {
@@ -200,6 +221,28 @@ func (d *Daemon) Run(ctx context.Context) error {
 		})
 	}
 	return d.runWithCert(ctx, tlsConf, rotator)
+}
+
+// runIDPMode 跑 per-user IdP 入网(Slice80):idpEnroll 取证书 + 会话凭证 → 填运行态 SessionTok/JTI → runWithCert。
+// 入网失败(用户没及时登录/IdP 拒/网络)→ 长驻降级重试(守护进程语义,绝不退出/崩)。
+func (d *Daemon) runIDPMode(ctx context.Context) error {
+	d.setState(StateEnrolling)
+	res, err := d.idpEnroll(ctx)
+	if err != nil {
+		log.Printf("[agentd] IdP 入网失败(降级重试): %v", err)
+		d.setState(StateDegraded)
+		return d.retryLoop(ctx, func(c context.Context) error {
+			r, e := d.idpEnroll(c)
+			if e != nil {
+				return e
+			}
+			d.cfg.SessionTok, d.cfg.SessionJTI = r.sessionTok, r.sessionJTI
+			return d.runWithCert(c, r.tlsConf, r.rotator)
+		})
+	}
+	// IdP 模式的会话凭证来自入网(非 env);填运行态供实时通道 + 撤销匹配(子块7 完整刷新调度为后续刀)。
+	d.cfg.SessionTok, d.cfg.SessionJTI = res.sessionTok, res.sessionJTI
+	return d.runWithCert(ctx, res.tlsConf, res.rotator)
 }
 
 // runWithCert 在已拿到设备 mTLS 配置后运行其余阶段(选址→握手→隧道→pump),失败进降级重试循环。

@@ -66,7 +66,7 @@ func TestPlatformRBACEndToEnd(t *testing.T) {
 		enroll.NewService(store, nil),
 		platform.NewService(store), nil, platformAuditSvc, rbacSvc,
 		testIDPSvc(t, store, secSvc),
-		nil, nil, verifier, nil, nil,
+		nil, nil, nil, verifier, nil, nil,
 		nil, // riskSvc
 	)
 	srv := httptest.NewServer(mux)

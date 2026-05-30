@@ -72,7 +72,7 @@ func TestSessionLoginCookieBridge(t *testing.T) {
 		platform.NewService(store),
 		nil, nil, nil,
 		testIDPSvc(t, store, secSvc),
-		nil, nil, verifier, nil, nil,
+		nil, nil, nil, verifier, nil, nil,
 		nil,
 	)
 	srv := httptest.NewServer(mux)
@@ -265,7 +265,7 @@ func newLoginOnlyServer(t *testing.T, verifier *cred.Verifier) *httptest.Server 
 		nil, nil,
 		nil, nil, nil,
 		nil,
-		nil, nil, verifier, nil, nil,
+		nil, nil, nil, verifier, nil, nil,
 		nil,
 	)
 	srv := httptest.NewServer(mux)

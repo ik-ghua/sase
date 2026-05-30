@@ -9,6 +9,8 @@
 // 守护进程 env(对齐 cmd/cpe 风格):
 //
 //	TENANT=<uuid> IDENTITY=<device-cn> [ZTP_CODE=<激活码>]      入网身份(ZTP_CODE 空则用 dev 共享 role:device 证书兜底)
+//	[ENROLL_MODE=ztp|idp]  入网方式(默认 ztp 激活码;idp = 真 OS 级 ZTNA per-user IdP 入网,Slice80)
+//	idp 模式额外:IDP_ID=<idp-config-uuid>  AGENT_ENROLL_URL=https://host:8443/api/v1/agent/enroll  IDP_AUTHORIZE_URL=<IdP authorize 端点+client_id+scope>
 //	SASE_TLS_DIR=./certs  MGMT_URL=https://host:8443  DEVICE_URL=https://host:8444  证书/管理面/续期端点
 //	POP_CANDIDATES="bj=10.0.0.1:9443,sh=10.0.0.2:9443"        候选 PoP(RTT 选最近;不硬编码单 IP)
 //	SDWAN_TUNNEL_ALG=chacha20poly1305  SDWAN_DATA_ADDR=0.0.0.0:0  [SDWAN_DATA_ADV=<adv>]  数据面
@@ -54,23 +56,27 @@ func runDaemon() error {
 	cands := parseCandidates(os.Getenv("POP_CANDIDATES"))
 
 	cfg := agentd.Config{
-		Tenant:       envMust("TENANT"),
-		Identity:     envMust("IDENTITY"),
-		ZTPCode:      os.Getenv("ZTP_CODE"),
-		MgmtURL:      envOr("MGMT_URL", "https://localhost:8443"),
-		DeviceURL:    envOr("DEVICE_URL", "https://localhost:8444"),
-		ServerName:   envOr("SASE_SERVER_NAME", "localhost"),
-		TLSDir:       envOr("SASE_TLS_DIR", "./certs"),
-		Alg:          envOr("SDWAN_TUNNEL_ALG", ""),
-		DataAddr:     envOr("SDWAN_DATA_ADDR", "0.0.0.0:0"),
-		DataAdvAddr:  os.Getenv("SDWAN_DATA_ADV"),
-		Candidates:   cands,
-		InternalCIDR: splitCSV(os.Getenv("INTERNAL_CIDR")),
-		InternalDNS:  splitCSV(os.Getenv("INTERNAL_DNS")),
-		ControlAddr:  os.Getenv("CONTROL_ADDR"),
-		SessionTok:   os.Getenv("SESSION_TOKEN"),
-		SessionJTI:   os.Getenv("SESSION_JTI"),
-		AgentVersion: agentVersion,
+		Tenant:          envMust("TENANT"),
+		Identity:        envMust("IDENTITY"),
+		ZTPCode:         os.Getenv("ZTP_CODE"),
+		EnrollMode:      envOr("ENROLL_MODE", agentd.EnrollModeZTP),
+		IDPID:           os.Getenv("IDP_ID"),
+		AgentEnrollURL:  os.Getenv("AGENT_ENROLL_URL"),
+		IDPAuthorizeURL: os.Getenv("IDP_AUTHORIZE_URL"),
+		MgmtURL:         envOr("MGMT_URL", "https://localhost:8443"),
+		DeviceURL:       envOr("DEVICE_URL", "https://localhost:8444"),
+		ServerName:      envOr("SASE_SERVER_NAME", "localhost"),
+		TLSDir:          envOr("SASE_TLS_DIR", "./certs"),
+		Alg:             envOr("SDWAN_TUNNEL_ALG", ""),
+		DataAddr:        envOr("SDWAN_DATA_ADDR", "0.0.0.0:0"),
+		DataAdvAddr:     os.Getenv("SDWAN_DATA_ADV"),
+		Candidates:      cands,
+		InternalCIDR:    splitCSV(os.Getenv("INTERNAL_CIDR")),
+		InternalDNS:     splitCSV(os.Getenv("INTERNAL_DNS")),
+		ControlAddr:     os.Getenv("CONTROL_ADDR"),
+		SessionTok:      os.Getenv("SESSION_TOKEN"),
+		SessionJTI:      os.Getenv("SESSION_JTI"),
+		AgentVersion:    agentVersion,
 	}
 
 	// 平台壳(Linux=真 TUN/ip route;macOS=真 utun/route;其余=unsupported 桩,Run 会返错退出)。

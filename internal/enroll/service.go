@@ -23,13 +23,14 @@ import (
 	"github.com/ikuai8/sase/internal/devpki"
 )
 
-// Kind 区分入网设备类型(对应 revtunnel 注册的两类设备)。
+// Kind 区分入网设备类型(对应 revtunnel 注册的两类设备 + ZTNA Agent)。
 const (
 	KindConnector = "connector" // ZTNA App Connector
 	KindCPE       = "cpe"       // SD-WAN 客户边缘
+	KindAgent     = "agent"     // 真 OS 级 ZTNA 端点 Agent(Slice80;经 /agent/enroll IdP 编排入网,非激活码)
 )
 
-func validKind(k string) bool { return k == KindConnector || k == KindCPE }
+func validKind(k string) bool { return k == KindConnector || k == KindCPE || k == KindAgent }
 
 // Device 是设备入网记录的**非敏感**只读视图(供 ZTP 可见性端点列出)。
 // 有意不含 activation_code(一次性激活码=秘密,泄漏即可被冒充兑换):入网记录里唯一的敏感字段。
@@ -49,6 +50,13 @@ type Service interface {
 	CreateEnrollment(ctx context.Context, tenantID, kind, identity string) (code string, err error)
 	// Redeem 由设备(凭激活码,无 mTLS)调用:校验激活码 + CSR,签发租户绑定证书,激活码作废。
 	Redeem(ctx context.Context, code string, csrPEM []byte) (certPEM []byte, err error)
+	// RedeemAgent 是真 OS 级 ZTNA Agent 的入网签发(Slice80,L2 §3.10.1):**不经激活码**——信任来自上层
+	// /agent/enroll 编排已完成的 IdP id_token 验签 + PKCE + code 一次性(控制面 Exchange);本方法只负责
+	// 「记设备入网账本 + 签租户绑定证书」。tenant 由编排上下文给(非设备自报),deviceID=证书 CN,userID=
+	// 同编排内 EnsureUser 产的 SASE 用户(cert↔cred 双绑定,可空则置 NULL)。
+	// 经 InTx(tenant RLS)upsert(ON CONFLICT (tenant_id, identity) DO UPDATE,kind='agent' + user_id)→
+	// SignCSR(tenant 进 Org、deviceID 进 CN、role:device 进 OU)。
+	RedeemAgent(ctx context.Context, tenantID, deviceID, userID string, csrPEM []byte) (certPEM []byte, err error)
 	// Renew 由设备(凭当前有效 mTLS 证书,非激活码)续期:tenant/identity 取自调用方已验证的证书,
 	// 校验入网记录仍有效(未撤销)后据新 CSR 签发延期证书(密钥轮换)。激活码不参与。
 	Renew(ctx context.Context, tenantID, identity string, csrPEM []byte) (certPEM []byte, err error)
@@ -90,6 +98,11 @@ func (s *service) recordAudit(ctx context.Context, tenantID, actor, action strin
 }
 
 func (s *service) CreateEnrollment(ctx context.Context, tenantID, kind, identity string) (string, error) {
+	// agent 入网经 /agent/enroll 的 IdP 编排(非激活码),绝不在此签发激活码(Slice80 reviewer S2:
+	// validKind 放行 KindAgent 是为 RedeemAgent,但激活码路径 CreateEnrollment 须显式拒 agent)。
+	if kind == KindAgent {
+		return "", fmt.Errorf("enroll: kind=%q 经 /agent/enroll IdP 入网,不签发激活码", KindAgent)
+	}
 	if !validKind(kind) {
 		return "", fmt.Errorf("enroll: kind 须为 %q 或 %q,得到 %q", KindConnector, KindCPE, kind)
 	}
@@ -161,6 +174,54 @@ func (s *service) Redeem(ctx context.Context, code string, csrPEM []byte) ([]byt
 		return nil, fmt.Errorf("enroll.Redeem 签发: %w", err)
 	}
 	s.recordAudit(ctx, tenantID, identity, "ZTP_ENROLL_REDEEM", 200)
+	return certPEM, nil
+}
+
+// RedeemAgent 见接口注释。与 Redeem(激活码)正交:本方法的信任前置由调用方(agentenroll 编排)在控制面
+// 完成 IdP 令牌交换后调用,**故无激活码、无一次性 status 跃迁**——同一用户同一设备重入网(换设备/重装)走
+// upsert 更新而非建新行(避免账本膨胀)。userID 可空(置 NULL);非空时记入 user_id 做 device↔user 关联。
+func (s *service) RedeemAgent(ctx context.Context, tenantID, deviceID, userID string, csrPEM []byte) ([]byte, error) {
+	if s.ca == nil {
+		return nil, errors.New("enroll.RedeemAgent: ZTP 签发未启用(缺 CA)")
+	}
+	if tenantID == "" {
+		return nil, errors.New("enroll.RedeemAgent: tenant 必填(应取自编排上下文)")
+	}
+	if _, err := uuid.Parse(tenantID); err != nil {
+		return nil, errors.New("enroll.RedeemAgent: tenant 非法 UUID")
+	}
+	if deviceID == "" {
+		return nil, errors.New("enroll.RedeemAgent: device_id 必填(=证书 CN)")
+	}
+	// 预检 CSR(在写账本前),无效 CSR 不写库。
+	if _, err := devpki.ValidateCSR(csrPEM); err != nil {
+		return nil, fmt.Errorf("enroll.RedeemAgent: %w", err)
+	}
+	// userID 折成 sql 参数(空→NULL,非空→FK→users.id;同租户内 RLS 校验由 FK + 表 RLS 保证)。
+	var userArg any
+	if userID != "" {
+		userArg = userID
+	}
+	err := s.store.InTx(ctx, tenantID, func(q data.Queries) error {
+		// upsert:同 (tenant_id, identity) 已存在(同设备重入网)→ 更新 kind/user_id;否则建新 'pending'→'redeemed'。
+		// status 直接置 'redeemed'(Agent 入网即兑换;激活码态不适用本路径)。activation_code 唯一约束需非空,
+		// 故填一个不可作为兑换码使用的占位(含 'agent:' 前缀,不匹配 Redeem 的 `<uuid>.<rand>` 格式且不会被 Redeem 查到)。
+		_, err := q.Exec(ctx,
+			`INSERT INTO device_enrollments (id, tenant_id, kind, identity, activation_code, status, redeemed_at, user_id)
+			 VALUES ($1,$2,'agent',$3,$4,'redeemed',now(),$5)
+			 ON CONFLICT (tenant_id, identity)
+			 DO UPDATE SET kind='agent', status='redeemed', redeemed_at=now(), user_id=EXCLUDED.user_id`,
+			uuid.NewString(), tenantID, deviceID, "agent:"+uuid.NewString(), userArg)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("enroll.RedeemAgent 记录: %w", err)
+	}
+	certPEM, err := s.ca.SignCSR(csrPEM, tenantID, deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("enroll.RedeemAgent 签发: %w", err)
+	}
+	s.recordAudit(ctx, tenantID, deviceID, "AGENT_ENROLL", 200)
 	return certPEM, nil
 }
 

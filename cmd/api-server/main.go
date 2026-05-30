@@ -23,6 +23,7 @@ import (
 	controlpb "github.com/ikuai8/sase/api/proto/sase/control/v1"
 	telemetrypb "github.com/ikuai8/sase/api/proto/sase/telemetry/v1"
 	"github.com/ikuai8/sase/internal/admin/httpapi"
+	"github.com/ikuai8/sase/internal/agentenroll"
 	"github.com/ikuai8/sase/internal/audit"
 	"github.com/ikuai8/sase/internal/authz"
 	"github.com/ikuai8/sase/internal/control"
@@ -199,7 +200,9 @@ func run() error {
 	}
 	// Slice60:管理面 HTTP RED 指标(请求计数 + 时延);独立 registry,/metrics 另端口暴露(下方 goroutine)。
 	apiRec := metrics.NewAPIRecorder()
-	httpapi.Register(app.Mux(), tenantSvc, identitySvc, policySvc, resourceSvc, auditSvc, swgSvc, siteSvc, fwSvc, dlpSvc, enrollSvc, platformSvc, popReg, platformAuditSvc, platformRBACSvc, idpSvc, buildOIDCDeps(idpSvc, identitySvc, auditSvc), enrollLimiter, verifier, adminActiveChecker, apiRec, riskSvc)
+	// Slice80:真 OS 级 ZTNA Agent per-user 入网编排(复用 idpSvc/identitySvc/enrollSvc/DispatchFactory)。
+	agentEnrollSvc := buildAgentEnrollDeps(idpSvc, identitySvc, enrollSvc)
+	httpapi.Register(app.Mux(), tenantSvc, identitySvc, policySvc, resourceSvc, auditSvc, swgSvc, siteSvc, fwSvc, dlpSvc, enrollSvc, platformSvc, popReg, platformAuditSvc, platformRBACSvc, idpSvc, buildOIDCDeps(idpSvc, identitySvc, auditSvc), agentEnrollSvc, enrollLimiter, verifier, adminActiveChecker, apiRec, riskSvc)
 
 	// /metrics 明文内部抓取(与 pop-agent/xds-server 对齐;运维 L2 3.10,客户不可见、数据不出域)。
 	go serveMetrics(ctx, envOr("SASE_API_METRICS_ADDR", ":9100"), apiRec.Handler())
@@ -443,6 +446,23 @@ func buildOIDCDeps(idpSvc idp.Service, identitySvc identity.Service, auditSvc au
 		Factory:     oidc.DispatchFactory,
 		CallbackURL: cb,
 	}
+}
+
+// buildAgentEnrollDeps 装配真 OS 级 ZTNA Agent per-user 入网编排(Slice80,L2 §3.10.1):
+// 复用既有 idpSvc(取 IdPConfig + 解密 client_secret)、identitySvc(EnsureUser + 签会话凭证)、
+// enrollSvc(RedeemAgent 签设备证书)、oidc.DispatchFactory(按 IdPConfig.Kind 派发 adapter)。
+//
+// **client_secret 永不下发设备**:adapter.Exchange(code+verifier→UserInfo)在控制面执行,client_secret
+// 只在 GetClientSecret 短窗内存。Factory 类型与 oidc.DispatchFactory 同签(返回 oidc.Adapter)。
+// 注:identity.Service 同时满足 agentenroll.IdentitySvc(EnsureUser)与 CredIssuer(IssueCredential)。
+func buildAgentEnrollDeps(idpSvc idp.Service, identitySvc identity.Service, enrollSvc enroll.Service) *agentenroll.Service {
+	return agentenroll.New(agentenroll.Config{
+		IDPSvc:  idpSvc,
+		Ensurer: identitySvc,
+		Issuer:  identitySvc,
+		Enroll:  enrollSvc,
+		Factory: oidc.DispatchFactory,
+	})
 }
 
 // sweepInterval 解析 SASE_SWEEP_INTERVAL(time.ParseDuration 格式,如 "10m"/"1h");空/0/非法 → 0(=不启)。

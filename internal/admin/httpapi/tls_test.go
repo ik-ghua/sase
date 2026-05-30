@@ -56,6 +56,7 @@ func TestAdminAPIServerTLS(t *testing.T) {
 		nil, // platform RBAC svc
 		testIDPSvc(t, store, secSvc),
 		nil, // oidc deps
+		nil, // agentEnrollSvc:本测不走 Agent 入网
 		nil, // 限流器(测试不限流)
 		verifier, nil, nil,
 		nil, // riskSvc

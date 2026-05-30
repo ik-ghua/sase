@@ -55,3 +55,7 @@ type Adapter interface {
 
 // GenerateCodeVerifier 生成 PKCE code_verifier(handler 用)。导出供测试与 handler 调用。
 func GenerateCodeVerifier() (string, error) { return generateCodeVerifier() }
+
+// CodeChallengeS256 由 code_verifier 算 PKCE code_challenge(method=S256)。
+// 导出供 Agent daemon(agentd.idpEnroll)本地构造 IdP authorize URL(daemon 持 verifier、只暴露 challenge)。
+func CodeChallengeS256(verifier string) string { return codeChallengeS256(verifier) }

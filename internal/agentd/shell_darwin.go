@@ -191,6 +191,14 @@ func (darwinSystemIntegration) Autostart(enable bool) error {
 	return nil
 }
 
+// OpenBrowser 用 `open` 拉起系统默认浏览器(IdP 入网,Slice80)。失败 → 返错(daemon 降级打印 url)。
+func (darwinSystemIntegration) OpenBrowser(url string) error {
+	if err := exec.Command("open", url).Start(); err != nil {
+		return fmt.Errorf("agentd/darwin: open 失败,请手动打开 %s: %w", url, err)
+	}
+	return nil
+}
+
 // NewPlatformShells 是 cmd/agent 装配 macOS 三窄壳的便捷构造(平台壳工厂)。
 func NewPlatformShells(tunName string, mtu int) (NetCapture, PostureProbe, SystemIntegration) {
 	return NewDarwinNetCapture(tunName, mtu), NewDarwinPostureProbe(), NewDarwinSystemIntegration()

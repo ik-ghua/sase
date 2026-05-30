@@ -72,7 +72,7 @@ func TestSitesEndpoint(t *testing.T) {
 		enroll.NewService(store, nil),
 		platform.NewService(store), nil, nil, nil,
 		testIDPSvc(t, store, secSvc),
-		nil, nil, verifier, nil, nil,
+		nil, nil, nil, verifier, nil, nil,
 		nil,
 	)
 	srv := httptest.NewServer(mux)

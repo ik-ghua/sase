@@ -74,7 +74,7 @@ func TestDevicesEndpoint(t *testing.T) {
 		enrollSvc,
 		platform.NewService(store), nil, nil, nil,
 		testIDPSvc(t, store, secSvc),
-		nil, nil, verifier, nil, nil,
+		nil, nil, nil, verifier, nil, nil,
 		nil,
 	)
 	srv := httptest.NewServer(mux)

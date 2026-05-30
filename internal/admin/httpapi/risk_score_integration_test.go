@@ -69,7 +69,7 @@ func TestRiskScoreEndpoint(t *testing.T) {
 		enroll.NewService(store, nil),
 		platform.NewService(store), nil, nil, nil,
 		testIDPSvc(t, store, secSvc),
-		nil, nil, verifier, nil, nil,
+		nil, nil, nil, verifier, nil, nil,
 		riskSvc,
 	)
 	srv := httptest.NewServer(mux)
@@ -182,7 +182,7 @@ func TestRiskScoreListEndpoint(t *testing.T) {
 		enroll.NewService(store, nil),
 		platform.NewService(store), nil, nil, nil,
 		testIDPSvc(t, store, secSvc),
-		nil, nil, verifier, nil, nil,
+		nil, nil, nil, verifier, nil, nil,
 		riskSvc,
 	)
 	srv := httptest.NewServer(mux)
@@ -297,7 +297,7 @@ func TestRiskScoreListEndpointNotConfigured(t *testing.T) {
 		enroll.NewService(store, nil),
 		platform.NewService(store), nil, nil, nil,
 		testIDPSvc(t, store, secSvc),
-		nil, nil, verifier, nil, nil,
+		nil, nil, nil, verifier, nil, nil,
 		nil, // riskSvc=nil
 	)
 	srv := httptest.NewServer(mux)
@@ -337,7 +337,7 @@ func TestRiskScoreEndpointNotConfigured(t *testing.T) {
 		enroll.NewService(store, nil),
 		platform.NewService(store), nil, nil, nil,
 		testIDPSvc(t, store, secSvc),
-		nil, nil, verifier, nil, nil,
+		nil, nil, nil, verifier, nil, nil,
 		nil, // riskSvc=nil
 	)
 	srv := httptest.NewServer(mux)

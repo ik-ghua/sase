@@ -115,6 +115,12 @@ func (g *Guard) Middleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// 公开:真 OS 级 ZTNA Agent per-user 入网(Slice80)。引导态设备无 mTLS 证书/无 SASE 凭证;
+		// 信任来自请求体 IdP code(控制面 Exchange 验 id_token 签名 + PKCE)。同 /enroll 形态免中间件鉴权。
+		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/agent/enroll" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		// 公开:IdP 登录入口与回调(用户尚未持有 SASE 凭证,经 IdP 认证后换发,Slice37a)
 		if r.Method == http.MethodGet && (r.URL.Path == "/api/v1/idp/login" || r.URL.Path == "/api/v1/idp/callback") {
 			next.ServeHTTP(w, r)

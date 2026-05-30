@@ -53,9 +53,12 @@ type PostureProbe interface {
 	Collect() (PostureFacts, error)
 }
 
-// SystemIntegration 是安装/权限/通知的平台壳接口(L2 §3.1)。本刀**最小**:仅 Notify(状态通知)
-// + Autostart(开机自启登记)桩;Elevate/安装/托盘 IPC = 后续刀。
+// SystemIntegration 是安装/权限/通知的平台壳接口(L2 §3.1)。本刀**最小**:Notify(状态通知)+
+// Autostart(开机自启登记)桩 + OpenBrowser(IdP 入网时拉起系统默认浏览器,Slice80);Elevate/安装/托盘 IPC = 后续刀。
 type SystemIntegration interface {
 	Notify(title, body string) error // 向用户通知(托盘气泡等;本刀壳可 log)
 	Autostart(enable bool) error     // 登记/取消开机自启(本刀壳可 log/桩)
+	// OpenBrowser 拉起系统默认浏览器到 url(IdP 用户认证入网,Slice80;linux=xdg-open、darwin=open、
+	// windows/其它=后续刀桩/log)。返回 err 不致命:daemon 可降级为打印 url 让用户手动打开。
+	OpenBrowser(url string) error
 }
