@@ -117,6 +117,28 @@ func (r *Router) removeLocked(tenant, site string) {
 	}
 }
 
+// UpdateCIDRs 只更新已登记站点的子网并重建该租户 trie(站点 CIDR 经 xDS 晚于握手到达时调用),
+// **原地保留该站点的会话实例(sess)与回程地址(addr)不变**——绝不重建会话。
+//
+// 为何不走 Register 重登记:Register 会换新 *Session(同握手密钥但 AEAD 发送计数器从 0 重起),
+// 而 nonce 仅由 (方向, 计数器) 派生、无随机盐/epoch → 计数器归零即 nonce 复用(同密钥+同 nonce 加密
+// 不同明文),对 GCM/ChaCha20-Poly1305 是机密性+认证灾难(Slice75 H1)。CIDR/路由与会话密钥无关,
+// 故此处只改 cidrs + 重建 trie,计数器连续。
+//
+// (tenant, site) 未登记 → no-op 返 false(握手尚未完成;握手时会用当时 siteReg 的 CIDR 登记)。
+func (r *Router) UpdateCIDRs(tenant, site string, cidrs []*net.IPNet) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, e := range r.byTenant[tenant] {
+		if e.site == site {
+			e.cidrs = cidrs
+			r.rebuildRoutesLocked(tenant)
+			return true
+		}
+	}
+	return false
+}
+
 // rebuildRoutesLocked 由 byTenant[tenant] 的站点 CIDR 重建该租户的 v4/v6 LPM trie(调用方持写锁)。
 // 重建(O(站点×CIDR))只在登记/注销的控制面路径发生(低频),换取选路热路径 O(地址位宽);
 // 全量重建保证 trie 与 byTenant 一致(终态只由当前站点集合决定,与增删顺序无关,等价原线性扫描)。

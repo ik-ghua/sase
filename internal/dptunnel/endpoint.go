@@ -44,6 +44,7 @@ func (e *Endpoint) pumpOut() {
 	for {
 		pkt, err := e.io.ReadPacket()
 		if err != nil {
+			log.Printf("[dptunnel] pumpOut 退出(TUN 读): %v", err)
 			return
 		}
 		frames, err := e.sess.Seal(pkt)
@@ -53,6 +54,7 @@ func (e *Endpoint) pumpOut() {
 		}
 		for _, f := range frames {
 			if _, err := e.conn.WriteTo(f, e.pop); err != nil {
+				log.Printf("[dptunnel] pumpOut 退出(UDP 写): %v", err)
 				return
 			}
 		}
@@ -65,6 +67,7 @@ func (e *Endpoint) pumpIn() {
 	for {
 		n, _, err := e.conn.ReadFrom(buf)
 		if err != nil {
+			log.Printf("[dptunnel] pumpIn 退出(UDP 读): %v", err)
 			return
 		}
 		pkts, err := e.sess.Open(append([]byte(nil), buf[:n]...))
@@ -73,6 +76,7 @@ func (e *Endpoint) pumpIn() {
 		}
 		for _, p := range pkts {
 			if err := e.io.WritePacket(p); err != nil {
+				log.Printf("[dptunnel] pumpIn 退出(TUN 写): %v", err)
 				return
 			}
 		}

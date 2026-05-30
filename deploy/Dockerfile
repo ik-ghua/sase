@@ -31,8 +31,9 @@ RUN go build -trimpath -ldflags "-s -w" -o /out/app ./cmd/${CMD}
 # ---- 运行阶段 ----
 # alpine 而非 scratch:需 ca-certificates(虽然内部走自签 mTLS,但保留通用 TLS 根)+ wget/sh
 # 供 healthcheck 与 init 容器编排(devpki 容器要写共享 certs volume)。
+# iproute2:SD-WAN CPE 容器演示需 `ip` 给 TUN 配 IP/路由(busybox 的 ip 不全;装完整 iproute2)。
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates wget
+RUN apk add --no-cache ca-certificates wget iproute2
 WORKDIR /app
 COPY --from=build /out/app /app/app
 # 默认以 root 运行:devpki init 容器需写 root 拥有的共享 certs volume,且写出的私钥为 0600(仅 owner 可读);

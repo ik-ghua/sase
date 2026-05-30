@@ -1,7 +1,8 @@
 # SASE 一键演示部署(deploy/)
 
 把全栈一键跑起来用于**现场演示**:Postgres + 迁移 + dev mTLS 证书 + 控制面(api-server)+
-配置分发(xds-server)+ 一个 PoP(pop-agent),并种子一个 demo 租户 + 一枚引导 platform_admin 令牌。
+配置分发(xds-server)+ 一个 PoP(pop-agent)+ **两个 SD-WAN 分支站点 CPE(cpe-site-a/b)经真隧道互通**,
+并种子一个 demo 租户 + 两站点 + ZTP 入网 + FWaaS 放行规则 + 一枚引导 platform_admin 令牌。
 
 > ⚠️ **全部 dev/演示用途**:自签 mTLS 证书(私钥在共享 volume)、内存 DevProvider KEK、bootstrap 令牌进日志、
 > 容器以 root 跑、Postgres 弱密码。**生产严禁原样使用**(证书须 PoP CA/KMS 经独立分发、KEK 走 KMS/HSM、
@@ -81,6 +82,35 @@ docker compose logs pop-agent | grep 装载
 PoP 接入面在 `:8081`(mTLS),连接器反向注册口 `:7000`。完整 ZTNA 端到端(agent 连接器
 → PoP → 上游)需另起 `cmd/agent` / `cmd/connector` / `cmd/echo-app`,本 demo 栈未含(见"未做项")。
 
+### 5. SD-WAN 真隧道:两分支站点经 PoP 互通(本栈已开)
+
+本栈含两个 **SD-WAN 软件 CPE** 容器(`cpe-site-a` 北京 10.10.0.0/24 / `cpe-site-b` 上海 10.20.0.0/24),
+经**真 dptunnel 隧道**(TUN + UDP + ChaCha20-Poly1305 AEAD,非 revtunnel L7 stand-in)过 pop-agent 互通:
+
+- 每个 CPE 凭 ZTP 激活码(seed 预置)换取**租户绑定证书**(tenant=Organization / site=CommonName,W9);
+- 与 pop-agent 做 **mutual-TLS 握手**(`tunhandshake`,RFC5705 导出会话密钥);
+- 建 TUN 设备 `sase0`,容器入口脚本(`cpe-entrypoint.sh`)配本站网关 IP + 对端站点路由;
+- 站点间转发经 pop-agent 的 `dptunnel.Router`:解封 → **FWaaS L3/L4 裁决**(seed 放行 site-a↔site-b)→ 按内层 dst IP 在租户路由域内选路 → 重封转发到对端 CPE。
+
+验证(站点 A → 站点 B,真隧道):
+
+```bash
+docker compose exec cpe-site-a ping -c 4 10.20.0.1   # → 0% packet loss(经隧道 + PoP + FWaaS allow)
+docker compose exec cpe-site-b ping -c 4 10.10.0.1   # 反向同样可达
+# TCP L4 也通(在 site-b 起监听,site-a 连):
+docker compose exec -d cpe-site-b sh -c "echo hi-from-b | nc -l -p 9999 -w 5"
+docker compose exec    cpe-site-a sh -c "echo probe | nc -w 3 10.20.0.1 9999"   # → 回显 hi-from-b
+
+# FWaaS 默认拒绝可见(去掉 seed 的 allow 规则则站点间被丢,计入丢包指标):
+docker compose exec pop-agent sh -c "wget -qO- http://127.0.0.1:9101/metrics | grep tunnel_drops"
+# → sase_pop_tunnel_drops_total{reason="firewall_deny"} N(无 FW allow 规则时站点间转发全丢)
+```
+
+> **依赖**:CPE 容器需 `cap_add: NET_ADMIN` + `devices: /dev/net/tun`(compose 已配)。Docker Desktop 的
+> 容器是 Linux,可建 TUN。CPE 的 ZTP 激活码**一次性**:首次成功握手后入网记录置 `redeemed`;**重起 CPE
+> 须 `docker compose down -v` 全清重来**(否则旧码已兑换 → ZTP 401)。算法档 dev 用 `chacha20poly1305`
+> (非国密);国密 SM4-GCM 档待国密 CPU(`SDWAN_TUNNEL_ALG=sm4gcm`,见 gm-crypto 选型)。
+
 ### 5. /metrics(内部抓取,容器内可达)
 
 各服务 `/metrics` 端口(未对宿主暴露,容器网络内 Prometheus/VictoriaMetrics 抓):
@@ -150,7 +180,31 @@ compose 的 `SASE_CSRF_ALLOWED_ORIGINS` 默认已含 `http://localhost:5173`(跨
 | /metrics | `METRICS_ADDR` | `:9101` | `:9101` |
 | 证书目录 | `SASE_TLS_DIR` | `./certs` | `/certs` |
 | W9 fail-closed | `SASE_REQUIRE_CERT_TENANT` | 关 | `.env` `REQUIRE_CERT_TENANT`(默认 0;生产 1) |
-| SD-WAN 隧道(可选) | `SDWAN_TUNNEL_ADDR` / `SDWAN_DATA_ADDR` / ... | (空=不启) | 未设(本 demo 不开 SD-WAN 数据面隧道) |
+| SD-WAN 握手 | `SDWAN_TUNNEL_ADDR` | (空=不启) | `:7200`(本 demo 已开 SD-WAN) |
+| SD-WAN 数据面 UDP | `SDWAN_DATA_ADDR` | `:7100` | `:7100` |
+| SD-WAN 数据面通告地址 | `SDWAN_DATA_ADV` | (默认本地监听地址) | `pop-agent:7100`(容器网络内 CPE 可达) |
+| SD-WAN 算法档 | `SDWAN_TUNNEL_ALG` | `chacha20poly1305` | `.env` `SDWAN_TUNNEL_ALG`(国密 `sm4gcm` 待国密 CPU) |
+
+### cpe-site-a / cpe-site-b(`cmd/cpe/main.go`,SD-WAN 软件 CPE)
+
+| 用途 | env | 默认 | compose 值 |
+|---|---|---|---|
+| 租户 | `TENANT` | (必填) | demo 租户 UUID |
+| 站点逻辑键(=证书 CN) | `SITE` | (必填) | `site-a` / `site-b` |
+| ZTP 激活码 | `ZTP_CODE` | (空=回退共享证书) | `.env` `SITE_A_ZTP_CODE` / `SITE_B_ZTP_CODE`(须与 seed 一致) |
+| 管理面(ZTP /enroll) | `MGMT_URL` | `https://localhost:8443` | `https://api-server:8443`(ServerName 仍验 localhost) |
+| 设备面(续期) | `DEVICE_URL` | `https://localhost:8444` | `https://api-server:8444` |
+| SD-WAN 真隧道开关 | `SDWAN_TUNNEL` | 关 | `1` |
+| PoP 握手地址 | `SDWAN_TUNNEL_ADDR` | (必填) | `pop-agent:7200` |
+| 本端数据面 UDP | `SDWAN_DATA_ADDR` | `127.0.0.1:0` | `:7101`(固定端口) |
+| 本端通告地址 | `SDWAN_DATA_ADV` | (默认本地监听地址) | `cpe-site-a:7101`(服务名→容器 IP,与源地址一致) |
+| TUN 设备名 | `SDWAN_TUN` | (内核分配) | `sase0` |
+| TUN 本站地址(entrypoint 用) | `CPE_TUN_ADDR` | — | `10.10.0.1/24` / `10.20.0.1/24` |
+| 对端站点 CIDR(entrypoint 用) | `CPE_PEER_CIDR` | — | `10.20.0.0/24` / `10.10.0.0/24` |
+
+> `SDWAN_DATA_ADV` 是 T1 新增的本端通告地址覆盖:容器/多址下 `dataConn.LocalAddr()`(`0.0.0.0`/ephemeral)
+> 不是 PoP 可达地址,须显式设为**服务名:固定端口**——既是 PoP 回程目的,又须与 PoP 看到的 UDP 源地址一致
+> (非 NAT 下 Docker 服务名解析的 IP == 源 IP),否则 PoP `bySrc` 解复用命中失败(`no_session` 丢包)。
 
 ### devpki(`cmd/devpki/main.go`)
 
@@ -200,8 +254,11 @@ PG 版本要求 **>= 15**(migration 0020 的 `NULLS NOT DISTINCT`),compose 用 `
 - **ZTNA 完整数据路径端到端未含**:本 demo 起到「PoP 接入控制面 + 订阅资源」。完整
   agent→连接器→PoP→上游 echo 需另起 `cmd/agent`/`cmd/connector`/`cmd/echo-app`(各有 env/证书需求),
   本栈聚焦"后端栈能起 + 控制台/API 可演示"。
-- **SD-WAN 数据面隧道未开**:pop-agent 的 `SDWAN_TUNNEL_ADDR` 未设(隧道需 TUN 设备 + 特权,
-  且 CPE 侧也要起)。FWaaS L4 真生效依赖此隧道,本 demo 不展示。
+- **SD-WAN 数据面隧道已开(T1)**:见"二、5"。两站点经真 dptunnel 隧道 + FWaaS L4 互通已端到端跑通。
+  诚实局限:① 仅非国密档(`chacha20poly1305`);国密 `sm4gcm` 待国密 CPU。② 单 PoP 实例(单租户);
+  多 PoP / per-PoP 租户分配未含。③ 非 NAT 假设(`SDWAN_DATA_ADV` 须与源地址一致);NAT 下 receiver-index
+  待握手 L2 §4.4。④ ZTP 激活码一次性、硬编码于 seed(重起须 `down -v`);生产经管理 API 动态签发。
+  ⑤ CPE TUN 配 IP/路由由 `cpe-entrypoint.sh` 在 TUN 出现后做(cpe 二进制本身不配,真实 CPE 由本地编排配)。
 - **前端未打进镜像**:见"三、前端控制台",本地 `pnpm dev` + `VITE_API_TARGET`。
 - **dev 安全取舍**:容器以 root 跑(共享 certs volume 私钥 0600)、自签 mTLS、内存 KEK、
   bootstrap 令牌进日志、PG 弱密码——全部生产严禁(见顶部 ⚠️)。

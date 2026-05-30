@@ -47,11 +47,19 @@ import (
 
 // siteCIDRs 是 site_key → 子网 的并发安全注册表(由站点 xDS 订阅更新,供 SD-WAN Router 选路目的)。
 type siteCIDRs struct {
-	mu sync.Mutex
-	m  map[string][]*net.IPNet
+	mu       sync.Mutex
+	m        map[string][]*net.IPNet
+	onUpdate func() // 可选:每次 set 后调(供已握手站点用新 CIDR 重登记 Router,解 xDS 晚到的竞态)
 }
 
 func newSiteCIDRs() *siteCIDRs { return &siteCIDRs{m: map[string][]*net.IPNet{}} }
+
+// setOnUpdate 设站点清单更新后的回调(SD-WAN 隧道启用时挂,用于 xDS 晚于握手到达时补登路由)。
+func (s *siteCIDRs) setOnUpdate(fn func()) {
+	s.mu.Lock()
+	s.onUpdate = fn
+	s.mu.Unlock()
+}
 
 // set 整体替换站点清单(解析 SiteInfo.CIDR;非法 CIDR 跳过并记日志)。
 func (s *siteCIDRs) set(sites []pop.SiteInfo) {
@@ -69,7 +77,11 @@ func (s *siteCIDRs) set(sites []pop.SiteInfo) {
 	}
 	s.mu.Lock()
 	s.m = m
+	fn := s.onUpdate
 	s.mu.Unlock()
+	if fn != nil {
+		fn() // 锁外调,避免回调里再访问 siteReg(get)自锁死锁
+	}
 }
 
 func (s *siteCIDRs) get(site string) []*net.IPNet {
@@ -279,6 +291,27 @@ func startSDWANTunnel(ctx context.Context, hsAddr, xdsAddr, tenantID, node strin
 	}
 	go router.Serve(ctx, dataConn)
 
+	// 已握手站点跟踪:site → established(供站点 CIDR(xDS)晚于握手到达时,用新 CIDR 重登记 Router)。
+	// 否则握手时 siteReg.get 取到空 CIDR(站点 xDS 尚未到)→ 该站点永无路由(握手只一次)。
+	var estMu sync.Mutex
+	established := map[string]tunhandshake.Established{}
+	reRegister := func() {
+		estMu.Lock()
+		snapshot := make([]tunhandshake.Established, 0, len(established))
+		for _, e := range established {
+			snapshot = append(snapshot, e)
+		}
+		estMu.Unlock()
+		for _, e := range snapshot {
+			// 只更新该站点的 CIDR 路由,**保留握手时建立的原会话**(AEAD 密钥与计数器连续)。
+			// 绝不在此重建会话:重建会复用旧密钥但把发送计数器归零 → nonce 复用(同密钥+同 nonce
+			// 加密不同明文),破坏隧道机密性/认证(Slice75 H1)。CIDR 与会话密钥无关,故只更路由。
+			// UpdateCIDRs 对未登记站点返 false(握手未完成,握手时会带当时 CIDR 登记),此处忽略返回值。
+			router.UpdateCIDRs(e.Tenant, e.Site, siteReg.get(e.Site))
+		}
+	}
+	siteReg.setOnUpdate(reRegister) // 站点 CIDR 每次更新后,已握手站点用新 CIDR 更新路由(不重建会话)
+
 	// 通告给 CPE 的数据面地址:NAT/多址下须经 SDWAN_DATA_ADV 显式设公网可达地址(默认取本地监听地址)。
 	advAddr := envOr("SDWAN_DATA_ADV", dataConn.LocalAddr().String())
 	srv := tunhandshake.NewServer(advAddr, alg, func(e tunhandshake.Established) {
@@ -291,8 +324,12 @@ func startSDWANTunnel(ctx context.Context, hsAddr, xdsAddr, tenantID, node strin
 			log.Printf("[pop-agent] 建 SD-WAN 会话失败 site=%s: %v", e.Site, serr)
 			return
 		}
+		estMu.Lock()
+		established[e.Site] = e // 记下,供 CIDR 晚到时重登记
+		estMu.Unlock()
 		router.Register(e.Tenant, e.Site, sess, e.CPEDataAddr, siteReg.get(e.Site))
-		log.Printf("[pop-agent] SD-WAN 站点接入 tenant=%s site=%s data=%s", e.Tenant, e.Site, e.CPEDataAddr)
+		log.Printf("[pop-agent] SD-WAN 站点接入 tenant=%s site=%s data=%s cidrs=%d",
+			e.Tenant, e.Site, e.CPEDataAddr, len(siteReg.get(e.Site)))
 	})
 
 	rawHs, err := net.Listen("tcp", hsAddr)

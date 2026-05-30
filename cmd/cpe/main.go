@@ -271,7 +271,14 @@ func runTunnel(ctx context.Context, tlsConf *tls.Config, tenant, site string) er
 	}
 	defer dataConn.Close()
 
-	res, err := tunhandshake.Dial(ctx, hsAddr, tlsConf, alg, dataConn.LocalAddr().String(), tenant, site)
+	// 通告给 PoP 的本端数据面地址(PoP 回程目的 + 入向解复用 bySrc 键)。
+	// 默认取本地监听地址,但 0.0.0.0/ephemeral 绑定下 LocalAddr 不是对端可达地址——
+	// 容器/多址部署须经 SDWAN_DATA_ADV 显式设为 PoP 可达且与实际 UDP 源地址一致的地址
+	// (如 "cpe-site-a:7101";Docker 嵌入式 DNS 解析为容器 IP,与 PoP 看到的源 IP+端口一致)。
+	// 否则 PoP 的 bySrc 解复用命中失败(no_session 丢包)且回程会被发往不可达的环回地址。
+	advAddr := envOr("SDWAN_DATA_ADV", dataConn.LocalAddr().String())
+
+	res, err := tunhandshake.Dial(ctx, hsAddr, tlsConf, alg, advAddr, tenant, site)
 	if err != nil {
 		return err
 	}
@@ -283,7 +290,7 @@ func runTunnel(ctx context.Context, tlsConf *tls.Config, tenant, site string) er
 	if err != nil {
 		return fmt.Errorf("打开 TUN(需 CAP_NET_ADMIN): %w", err)
 	}
-	log.Printf("[cpe] SD-WAN 真隧道:site=%s TUN=%s PoP数据面=%s 档=%s", site, name, res.PoPDataAddr, res.Alg)
+	log.Printf("[cpe] SD-WAN 真隧道:site=%s TUN=%s 本端通告=%s PoP数据面=%s 档=%s", site, name, advAddr, res.PoPDataAddr, res.Alg)
 	log.Printf("[cpe] 提示:须为 %s 配 IP/路由(本站子网→%s),使本地 L3 包进隧道", name, name)
 	dptunnel.NewEndpoint(sess, tun, dataConn, res.PoPDataAddr).Run(ctx) // 阻塞到 ctx 取消或 pump 出错
 	return nil
