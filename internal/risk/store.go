@@ -110,13 +110,23 @@ func (s *Service) GetScore(ctx context.Context, tenantID, subject string) (*Scor
 		return nil, err
 	}
 	out := &Score{Subject: subject, Score: score, Level: Level(level), UpdatedAt: updatedAt}
-	if len(factorsdb) > 0 {
-		if e := json.Unmarshal(factorsdb, &out.Factors); e != nil {
-			// 反序列化失败不致命:返回核心快照(score/level),factors 降级为空(配 log 排障)
-			log.Printf("[risk] 快照 factors 反序列化失败 tenant=%s subject=%s: %v", tenantID, subject, e)
-		}
-	}
+	out.Factors = decodeFactors(factorsdb, tenantID, subject)
 	return out, nil
+}
+
+// decodeFactors 把库中 factors jsonb 原始字节解码为 []Factor;**反序列化失败不致命**——返回 nil
+// (核心快照 score/level 仍可用,可解释性降级为空),并记日志供排障。GetScore / ListScores 复用此单源。
+// raw 为空(NULL 列)直接返回 nil(无 factors,非错误)。
+func decodeFactors(raw []byte, tenantID, subject string) []Factor {
+	if len(raw) == 0 {
+		return nil
+	}
+	var factors []Factor
+	if e := json.Unmarshal(raw, &factors); e != nil {
+		log.Printf("[risk] 快照 factors 反序列化失败 tenant=%s subject=%s: %v", tenantID, subject, e)
+		return nil
+	}
+	return factors
 }
 
 // ErrNoStore 表示快照层未配置(WithStore 未注入)——GetScore 无法读持久化态(fail-loud)。
@@ -152,12 +162,7 @@ func (s *Service) ListScores(ctx context.Context, tenantID string) ([]Score, err
 				return fmt.Errorf("risk.ListScores scan: %w", e)
 			}
 			sc.Level = Level(level)
-			if len(factorsdb) > 0 {
-				if e := json.Unmarshal(factorsdb, &sc.Factors); e != nil {
-					// 反序列化失败不致命:返回核心快照(score/level),factors 降级为空(配 log 排障)
-					log.Printf("[risk] 快照 factors 反序列化失败(列表)tenant=%s subject=%s: %v", tenantID, sc.Subject, e)
-				}
-			}
+			sc.Factors = decodeFactors(factorsdb, tenantID, sc.Subject)
 			out = append(out, sc)
 		}
 		return rows.Err()

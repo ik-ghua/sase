@@ -201,6 +201,35 @@ func TestRiskListScoresNoStore(t *testing.T) {
 	}
 }
 
+// TestRiskScoreLevelCheckRejectsInvalid:经 store 直插非法 level → DB CHECK(0024 chk_risk_level)拒绝。
+// 验证 DB 层纵深防线:即便绕过应用枚举(直写 SQL),非法 level 也写不进表。
+// 前置:migration 0024 已应用(否则约束不存在 → 该插入会成功,测试失败提示缺迁移)。
+func TestRiskScoreLevelCheckRejectsInvalid(t *testing.T) {
+	store, ctx := newStore(t)
+	tid := uuid.NewString()
+
+	// 直插非法 level(绕过 store.go 的 persistSnapshot 应用路径),应被 DB CHECK 拒。
+	err := store.InTx(ctx, tid, func(q data.Queries) error {
+		_, e := q.Exec(ctx,
+			`INSERT INTO risk_scores (tenant_id, subject, score, level) VALUES ($1,$2,$3,$4)`,
+			tid, "bad-subject", 50, "bogus")
+		return e
+	})
+	if err == nil {
+		t.Fatal("非法 level 'bogus' 应被 DB CHECK(chk_risk_level)拒绝;若通过则 migration 0024 未应用")
+	}
+
+	// 反证:合法 level 同路径应成功落库(确认约束不误伤合法值)。
+	if e := store.InTx(ctx, tid, func(q data.Queries) error {
+		_, ex := q.Exec(ctx,
+			`INSERT INTO risk_scores (tenant_id, subject, score, level) VALUES ($1,$2,$3,$4)`,
+			tid, "good-subject", 90, string(risk.LevelCritical))
+		return ex
+	}); e != nil {
+		t.Fatalf("合法 level 应落库成功,得 %v", e)
+	}
+}
+
 // assertRowCount 在租户 RLS 上下文内断言 risk_scores 行数(验 upsert 单行,非追加)。
 func assertRowCount(t *testing.T, ctx context.Context, store data.Store, tid, subject string, want int) {
 	t.Helper()
