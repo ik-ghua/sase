@@ -18,9 +18,10 @@ type AppResolver struct {
 }
 
 type appRule struct {
-	cidr    *net.IPNet
-	dstPort uint16 // 0 = 任意端口
-	appKey  string
+	cidr      *net.IPNet
+	dstPort   uint16 // 0 = 任意端口
+	appKey    string
+	connector bool // true=走零暴露 connector 反向出站(Slice78);false=PoP-TUN SNAT(Slice77,缺省)
 }
 
 // NewAppResolver 构造空解析器。
@@ -28,9 +29,15 @@ func NewAppResolver() *AppResolver {
 	return &AppResolver{byTenant: map[string][]appRule{}}
 }
 
-// Add 登记一条解析规则:本租户内 dst ∈ cidr 且(dstPort==0 或 命中)→ appKey。
-// cidrStr 非法 → 返回 error(fail-loud,装配期发现配置错,不静默吞)。
+// Add 登记一条解析规则(connector=false,即 PoP-TUN SNAT 出站;向后兼容 Slice77 调用)。
 func (ar *AppResolver) Add(tenant, cidrStr string, dstPort uint16, appKey string) error {
+	return ar.AddRule(tenant, cidrStr, dstPort, appKey, false)
+}
+
+// AddRule 登记一条解析规则:本租户内 dst ∈ cidr 且(dstPort==0 或 命中)→ appKey。
+// connector=true → 该 resource 走零暴露 connector 反向出站(Slice78);false → PoP-TUN SNAT(Slice77)。
+// cidrStr 非法 → 返回 error(fail-loud,装配期发现配置错,不静默吞)。
+func (ar *AppResolver) AddRule(tenant, cidrStr string, dstPort uint16, appKey string, connector bool) error {
 	if tenant == "" || appKey == "" {
 		return fmt.Errorf("ztnaterm: appResolver 规则缺 tenant/appKey")
 	}
@@ -38,13 +45,33 @@ func (ar *AppResolver) Add(tenant, cidrStr string, dstPort uint16, appKey string
 	if err != nil {
 		return fmt.Errorf("ztnaterm: appResolver CIDR %q 非法: %w", cidrStr, err)
 	}
-	ar.byTenant[tenant] = append(ar.byTenant[tenant], appRule{cidr: n, dstPort: dstPort, appKey: appKey})
+	ar.byTenant[tenant] = append(ar.byTenant[tenant], appRule{cidr: n, dstPort: dstPort, appKey: appKey, connector: connector})
 	return nil
 }
 
 // Resolve 在 tenant 域内把 (dst, dstPort) 解析为 appKey。无任一匹配 → ("", false)。
 // 仅查 tenant 自己的规则集(跨租户隔离);v4/v6 由 net.IPNet.Contains 自然处理同族比较。
+//
+// 注:本方法保留 (appKey, ok) 二值签名,供包路径(decide)向后兼容;透明代理用 ResolveRule 取 connector 标志。
 func (ar *AppResolver) Resolve(tenant string, dst net.IP, dstPort uint16) (string, bool) {
+	r, ok := ar.resolveRule(tenant, dst, dstPort)
+	if !ok {
+		return "", false
+	}
+	return r.appKey, true
+}
+
+// ResolveRule 在 tenant 域内解析目的,返回 appKey + 是否走 connector(Slice78 零暴露)。无匹配 → ("",false,false)。
+func (ar *AppResolver) ResolveRule(tenant string, dst net.IP, dstPort uint16) (appKey string, connector, ok bool) {
+	r, found := ar.resolveRule(tenant, dst, dstPort)
+	if !found {
+		return "", false, false
+	}
+	return r.appKey, r.connector, true
+}
+
+// resolveRule 取本租户域内第一条 CIDR+端口命中的规则。
+func (ar *AppResolver) resolveRule(tenant string, dst net.IP, dstPort uint16) (appRule, bool) {
 	for _, r := range ar.byTenant[tenant] {
 		if !r.cidr.Contains(dst) {
 			continue
@@ -52,24 +79,37 @@ func (ar *AppResolver) Resolve(tenant string, dst net.IP, dstPort uint16) (strin
 		if r.dstPort != 0 && r.dstPort != dstPort {
 			continue
 		}
-		return r.appKey, true
+		return r, true
 	}
-	return "", false
+	return appRule{}, false
 }
 
 // AddSpec 解析并登记一条 spec 字符串(env 注入便捷形式):
 //
-//	"<tenant>=<cidr>[:port]=<appKey>"   端口可省(=任意端口)
+//	"<tenant>=<cidr>[:port]=<appKey>[@connector]"   端口可省(=任意端口);@connector 可省(=PoP-TUN SNAT)
 //
-// 例:`11111111-...=10.99.0.0/24=internal-app` 或 `t1=10.99.0.5/32:80=web`。
+// 例:
+//
+//	11111111-...=10.99.0.0/24=internal-app            PoP-TUN SNAT 出站(Slice77,缺省,向后兼容)
+//	11111111-...=10.123.0.50/32=internal-app@connector 走零暴露 connector 反向出站(Slice78)
+//	t1=10.99.0.5/32:80=web                            端口约束
 func (ar *AppResolver) AddSpec(spec string) error {
 	parts := strings.Split(spec, "=")
 	if len(parts) != 3 {
-		return fmt.Errorf("ztnaterm: appResolver spec %q 非法,应为 tenant=cidr[:port]=appKey", spec)
+		return fmt.Errorf("ztnaterm: appResolver spec %q 非法,应为 tenant=cidr[:port]=appKey[@connector]", spec)
 	}
 	tenant := strings.TrimSpace(parts[0])
 	dest := strings.TrimSpace(parts[1])
-	appKey := strings.TrimSpace(parts[2])
+	appField := strings.TrimSpace(parts[2])
+
+	// 尾缀 @connector(Slice78):走零暴露 connector 反向出站;缺省 PoP-TUN SNAT(向后兼容)。
+	connector := false
+	appKey := appField
+	if strings.HasSuffix(appField, "@connector") {
+		connector = true
+		appKey = strings.TrimSpace(strings.TrimSuffix(appField, "@connector"))
+	}
+
 	cidrStr := dest
 	var port uint16
 	// 仅当 ":port" 形式且不是 IPv6 字面量(含多个冒号)时解析端口。CIDR 网络段不含冒号(IPv4)。
@@ -81,7 +121,7 @@ func (ar *AppResolver) AddSpec(spec string) error {
 		}
 		port = p
 	}
-	return ar.Add(tenant, cidrStr, port, appKey)
+	return ar.AddRule(tenant, cidrStr, port, appKey, connector)
 }
 
 func parsePort(s string) (uint16, error) {

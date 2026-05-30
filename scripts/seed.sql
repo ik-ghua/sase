@@ -68,6 +68,15 @@ INSERT INTO device_enrollments (id, tenant_id, kind, identity, activation_code, 
    '11111111-1111-1111-1111-111111111111.cccccccccccccccccccccccccccccccc', 'pending')
 ON CONFLICT (tenant_id, identity) DO NOTHING;
 
+-- ⑥' App Connector(Slice78 零暴露面出站)的 ZTP 入网记录(kind=connector;identity=证书 CN=App 名)。
+--    connector 容器以 ZTP_CODE 换租户绑定证书(tenant=Org / CN=internal-app,W9);MODE=stream 拨向
+--    pop-agent 注册口注册 Hello{tenant, app="internal-app", mode=stream};register 顶端 W9 校验证书租户==Hello.tenant。
+--    PoP ZTNA 透明代理对 connector-backed 流经 OpenStream(tenant,"internal-app",dst) 反向送本 connector → UPSTREAM。
+INSERT INTO device_enrollments (id, tenant_id, kind, identity, activation_code, status) VALUES
+  ('44444444-4444-4444-4444-444444444444', :'demo_tenant', 'connector', 'internal-app',
+   '11111111-1111-1111-1111-111111111111.dddddddddddddddddddddddddddddddd', 'pending')
+ON CONFLICT (tenant_id, identity) DO NOTHING;
+
 -- ⑦ ZTNA 策略 PolicyBundle(编译态,直插供 xDS 下发 PoP;PoP PEP 据此逐流裁决,Slice77 §3.3)。
 --    compiled = marshal(xdsv1.PolicyBundle):放行 group=eng → resource=internal-app(allow),
 --    其余默认拒绝(default-deny)——故 secret-app(无匹配规则)体现 deny 路径。

@@ -13,11 +13,13 @@
 package revtunnel
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -27,10 +29,23 @@ import (
 )
 
 // Hello 是连接器拨出后的注册信息。
+//
+// Mode 选择连接器承载形态(Slice78):
+//   - ""(缺省)/"http":HTTP RoundTrip(W1,既有);PoP 经 routes 表逐请求往返(Request/Response 帧)。
+//   - "stream":原始 TCP 流 mux(Slice78 零暴露面);PoP 经 streamRoutes 表用 OpenStream 开任意 TCP 流。
+//
+// 两 mode 物理分表(routes vs streamRoutes)、互不影响;W9 证书租户绑定对两者都生效(register 顶端校验)。
 type Hello struct {
 	Tenant string `json:"tenant"`
 	App    string `json:"app"`
+	Mode   string `json:"mode,omitempty"`
 }
+
+// Hello.Mode 取值。
+const (
+	ModeHTTP   = "http"   // 缺省:HTTP RoundTrip(W1)
+	ModeStream = "stream" // 原始 TCP 流 mux(Slice78 零暴露面出站)
+)
 
 // Request 是 PoP 经反向通道发给连接器的请求。
 //
@@ -115,10 +130,17 @@ func dial(ctx context.Context, addr string, tlsConf *tls.Config) (net.Conn, erro
 
 // ---- PoP 侧(接受注册 + 反向请求) ----
 
-// Registry 持各 (tenant,app) 的已注册连接器连接,供 PoP 反向 RoundTrip。
+// Registry 持各 (tenant,app) 的已注册连接器连接,供 PoP 反向 RoundTrip(HTTP)/ OpenStream(原始 TCP 流)。
+//
+// 两类承载物理分表、互不影响(Slice78):
+//   - routes:HTTP RoundTrip 连接器(W1,Hello.Mode=""/http);每连接串行往返。
+//   - streamRoutes:原始 TCP 流 mux 连接器(Slice78,Hello.Mode=stream);每连接经 muxConn 并发多流。
+//
+// 两表共用同一把 mu。W9 证书租户绑定在 register 顶端对两 mode 统一校验(certTenant==Hello.Tenant)。
 type Registry struct {
 	mu                sync.Mutex
 	routes            map[string]*connector
+	streamRoutes      map[string]*muxConn
 	requireCertTenant bool // 见 WithRequireCertTenant
 }
 
@@ -135,7 +157,7 @@ func WithRequireCertTenant() Option {
 }
 
 func NewRegistry(opts ...Option) *Registry {
-	r := &Registry{routes: map[string]*connector{}}
+	r := &Registry{routes: map[string]*connector{}, streamRoutes: map[string]*muxConn{}}
 	for _, o := range opts {
 		o(r)
 	}
@@ -151,6 +173,22 @@ type connector struct {
 }
 
 func key(tenant, app string) string { return tenant + "/" + app }
+
+// trimLeadingJSONSpace 剥掉前导 JSON 值间空白(RFC 8259 §2:空格/制表/CR/LF)。用于 stream-mode 注册:
+// json.Encoder.Encode 在 Hello 后写 '\n',Decode 把它留在缓冲;这些空白字节均非合法首帧 Type(1..4),
+// 剥掉后剩余字节(若有,即 connector 在 Hello 后紧跟发的真实帧)接 conn 作读帧源。
+func trimLeadingJSONSpace(b []byte) []byte {
+	i := 0
+	for i < len(b) {
+		switch b[i] {
+		case ' ', '\t', '\r', '\n':
+			i++
+		default:
+			return b[i:]
+		}
+	}
+	return b[i:]
+}
 
 // peerCertTenant 从对端 mTLS 证书(已经 ServerTLS RequireAndVerifyClientCert 校验)提取所属租户。
 // 非 TLS 连接或证书无租户标记(dev 共享证书)→ (",false),调用方不施加约束。
@@ -204,6 +242,21 @@ func (r *Registry) register(conn net.Conn) {
 		conn.Close()
 		return
 	}
+	// W9 已统一校验(上方)。按 Hello.Mode 分流:stream 走 muxConn(原始 TCP 流),其余走 HTTP routes(既有,字节级不动)。
+	if hello.Mode == ModeStream {
+		// json.Decoder 读 Hello 时会把 Hello JSON 之后、conn 上已到达的字节预读进内部缓冲。
+		// **关键**:json.Encoder.Encode 在 Hello JSON 后写一个 '\n'(值分隔符),Decode 解完 Hello 把该 '\n'
+		// 留在缓冲里;若直接喂给二进制 mux,'\n'(0x0a)会被当成首帧的 Type 字节 → 整条帧流错位 → mux 崩。
+		// 故先把缓冲读出、剥掉前导 JSON 空白(空格/制表/CR/LF,均非合法首帧 Type=1..4),再接 conn 前作读帧源。
+		buffered, berr := io.ReadAll(dec.Buffered())
+		if berr != nil {
+			conn.Close()
+			return
+		}
+		buffered = trimLeadingJSONSpace(buffered)
+		r.registerStream(hello, conn, bytes.NewReader(buffered))
+		return
+	}
 	c := &connector{enc: json.NewEncoder(conn), dec: dec, conn: conn}
 	r.mu.Lock()
 	if old := r.routes[key(hello.Tenant, hello.App)]; old != nil {
@@ -211,6 +264,47 @@ func (r *Registry) register(conn net.Conn) {
 	}
 	r.routes[key(hello.Tenant, hello.App)] = c
 	r.mu.Unlock()
+}
+
+// registerStream 登记一个 stream-mode 连接器(Slice78):起 muxConn 读循环,登入 streamRoutes。
+// W9 已在 register 顶端校验(此处 hello.Tenant 已绑定到证书租户)。buffered = json.Decoder 读 Hello 时
+// 预读但未消费的字节(须接在 conn 前作为读帧源,见调用方)。
+func (r *Registry) registerStream(hello Hello, conn net.Conn, buffered io.Reader) {
+	rd := io.MultiReader(buffered, conn)   // 读帧:先消费 decoder 缓冲,再读 conn
+	mc := newMuxConnReader(conn, rd, true) // PoP 侧:server=true(只接收 connector 经 DATA/CLOSE/RST 应答,自身发 OPEN)
+	r.mu.Lock()
+	if old := r.streamRoutes[key(hello.Tenant, hello.App)]; old != nil {
+		old.Close() // 替换旧连接器(关旧 mux:其上所有流被 RST/关闭)
+	}
+	r.streamRoutes[key(hello.Tenant, hello.App)] = mc
+	r.mu.Unlock()
+	go func() {
+		mc.readLoop() // 阻塞到 conn 断开
+		r.evictStream(hello.Tenant, hello.App, mc)
+	}()
+}
+
+// OpenStream 在 (tenant,app) 的 stream-mode 连接器上开一条原始 TCP 流(Slice78 零暴露面出站)。
+// key 含 tenant → A 租户永远查不到 B 租户 connector(跨租户隔离)。dst 是原始目的 host:port,
+// 经 OPEN 帧透给 connector 侧 net.Dial。无连接器 → ErrNoConnector。
+func (r *Registry) OpenStream(tenant, app, dst string) (io.ReadWriteCloser, error) {
+	r.mu.Lock()
+	mc := r.streamRoutes[key(tenant, app)]
+	r.mu.Unlock()
+	if mc == nil {
+		return nil, ErrNoConnector
+	}
+	return mc.openStream(dst)
+}
+
+// evictStream 在 mux 连接断开时摘除该 stream 连接器(下次 OpenStream 返回 ErrNoConnector)。
+func (r *Registry) evictStream(tenant, app string, mc *muxConn) {
+	r.mu.Lock()
+	if r.streamRoutes[key(tenant, app)] == mc {
+		delete(r.streamRoutes, key(tenant, app))
+	}
+	r.mu.Unlock()
+	mc.Close()
 }
 
 // RoundTrip 把请求经 (tenant,app) 的连接器反向送达并取回响应。无连接器 → ErrNoConnector。

@@ -204,7 +204,7 @@ func run() error {
 	// 使撤销下发回调能调 term.EvictRevoked(主撤销路径,长连权威闭合,Slice77 §3.1)。不设 → term=nil 不启。
 	var ztnaTerm *ztnaterm.Terminator
 	if os.Getenv("ZTNA_TUNNEL_ADDR") != "" {
-		t, terr := startZTNATermination(ctx, tenantID, verifier, bundles, revoked, rec, serverTLS)
+		t, terr := startZTNATermination(ctx, tenantID, verifier, bundles, revoked, registry, rec, serverTLS)
 		if terr != nil {
 			return terr
 		}
@@ -367,9 +367,15 @@ func startSDWANTunnel(ctx context.Context, hsAddr, xdsAddr, tenantID, node strin
 // 握手(mutual TLS1.3 + RFC5705 + **会话凭证验证**,tunhandshake.NewServerWithCred)→ 建会话登终结表 →
 // 收 Agent 隧道包 → 解封 → 逐流 PEP → allow 写 PoP-TUN(内核 SNAT 出站)。共享 verifier/bundles/revoked/rec。
 //
-// 出站后端 = PoP-TUN + 内核 SNAT(§3.4 b):本函数只开 TUN + 读写包;ip_forward/route/MASQUERADE 由
-// 容器 entrypoint 配(deploy/pop-entrypoint.sh)。appResolver 经 ZTNA_APP_RESOLVE env(静态注入,第一刀)。
-func startZTNATermination(ctx context.Context, tenantID string, verifier *cred.Verifier, bundles *pop.BundleStore, revoked *pop.RevocationStore, rec *metrics.Recorder, serverTLS *tls.Config) (*ztnaterm.Terminator, error) {
+// 出站后端(两路按 dst CIDR 内核分流,§3.4.1):
+//   - PoP-TUN + 内核 SNAT(§3.4 b,Slice77):非 connector 网段;本函数开 TUN,ip_forward/route/MASQUERADE
+//     由容器 entrypoint 配(deploy/pop-entrypoint.sh)。
+//   - REDIRECT 透明代理 + revtunnel 原始 TCP 流(§3.4 c,Slice78):connector-backed CIDR 经 iptables
+//     REDIRECT 到 ZTNA_PROXY_PORT,透明代理 fail-closed lookup + 连接级 PEP + reg.OpenStream 反向出站(零暴露)。
+//
+// appResolver 经 ZTNA_APP_RESOLVE env(静态注入,第一刀);@connector 标志的 resource 走零暴露 connector。
+// registry = 与连接器反向注册口共享的同一注册表(stream-mode connector 经 OpenStream 反向出站)。
+func startZTNATermination(ctx context.Context, tenantID string, verifier *cred.Verifier, bundles *pop.BundleStore, revoked *pop.RevocationStore, registry *revtunnel.Registry, rec *metrics.Recorder, serverTLS *tls.Config) (*ztnaterm.Terminator, error) {
 	hsAddr := os.Getenv("ZTNA_TUNNEL_ADDR")
 	dataAddr := envOr("ZTNA_DATA_ADDR", ":7300")
 	alg := envOr("ZTNA_TUNNEL_ALG", dptunnel.AlgChaCha20Poly1305)
@@ -401,7 +407,8 @@ func startZTNATermination(ctx context.Context, tenantID string, verifier *cred.V
 			sessionCap = d
 		}
 	}
-	term := ztnaterm.New(verifier, bundles, revoked, apps, tun, rec, sessionCap)
+	term := ztnaterm.New(verifier, bundles, revoked, apps, tun, rec, sessionCap).
+		WithRegistry(registry) // Slice78:透明代理对 connector-backed 流经 OpenStream 反向出站(零暴露)
 
 	// 数据面 UDP 监听 + Serve(入向 worker pool + 回程 pump)。
 	dataConn, err := net.ListenPacket("udp", dataAddr)
@@ -410,6 +417,22 @@ func startZTNATermination(ctx context.Context, tenantID string, verifier *cred.V
 	}
 	go term.Serve(ctx, dataConn)
 	go term.RunExpirySweep(ctx, time.Minute) // deadline 兜底闸的主动回收(惰性检查已覆盖来包路径)
+
+	// Slice78 零暴露透明代理:ZTNA_PROXY_PORT 设则起 REDIRECT listener。内核 iptables 把 connector-backed
+	// CIDR 的 TCP 流 REDIRECT 到本端口(pop-entrypoint 配);透明代理 fail-closed lookup + 连接级 PEP +
+	// reg.OpenStream 反向送 app(私网零入站开口)。不设 → 仅 PoP-TUN SNAT 出站(Slice77 行为不变)。
+	if proxyPort := os.Getenv("ZTNA_PROXY_PORT"); proxyPort != "" {
+		proxyAddr := proxyPort
+		if !strings.Contains(proxyAddr, ":") {
+			proxyAddr = ":" + proxyAddr
+		}
+		proxyLis, perr := net.Listen("tcp", proxyAddr)
+		if perr != nil {
+			return nil, fmt.Errorf("监听 ZTNA 透明代理 %s: %w", proxyAddr, perr)
+		}
+		go term.RunRedirectProxy(ctx, proxyLis)
+		log.Printf("[pop-agent] ZTNA 零暴露透明代理监听 %s(内核 REDIRECT → 连接级 PEP → connector 反向出站)", proxyAddr)
+	}
 
 	if advAddr == "" {
 		advAddr = dataConn.LocalAddr().String()

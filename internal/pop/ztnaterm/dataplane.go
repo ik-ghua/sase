@@ -102,9 +102,10 @@ func (tm *Terminator) forwardInner(ts *termSession, pkt []byte) {
 	}
 }
 
-// decide 逐流裁决:命中流缓存复用;首流(或缓存过期)→ appResolver 解析目的 → 新流闸查吊销 →
-// pep.Decide → 缓存(allow/deny + TTL)。返回 (allow, dropReason)。**inspect 第一刀 = allow**(注明:
-// SWG/DLP 在包路径需 TCP 重组,留后续刀;该拒的已被 PEP deny 拦下,对齐 ingress 非对称哲学)。
+// decide 逐流裁决:命中流缓存复用;首流(或缓存过期)→ appResolver 解析目的 → decideResource
+// (新流闸查吊销 + pep.Decide)→ 缓存(allow/deny + TTL)。返回 (allow, dropReason)。
+// **inspect 第一刀 = allow**(注明:SWG/DLP 在包路径需 TCP 重组,留后续刀;该拒的已被 PEP deny 拦下,
+// 对齐 ingress 非对称哲学)。
 func (tm *Terminator) decide(ts *termSession, t fiveTuple) (bool, string) {
 	key := keyOf(t)
 	now := tm.now()
@@ -119,32 +120,23 @@ func (tm *Terminator) decide(ts *termSession, t fiveTuple) (bool, string) {
 	}
 	ts.mu.Unlock()
 
-	// 首流(或缓存过期):重新裁决。
-	// 新流闸(§3.1):再查吊销(复用表项握手时存的 jti;同 session 内 jti 不变,不重解析凭证)。
-	if tm.revoked != nil && tm.revoked.IsRevoked(ts.tenant, ts.claims.JTI) {
-		// 命中撤销:主动拆 session(不只拒本流)——长连权威闭合的兜底(主路径是 EvictRevoked 回调)。
-		tm.mu.RLock()
-		srcKey := ts.srcAddr.String()
-		tm.mu.RUnlock()
-		tm.evictSession(srcKey, ts, reasonRevoked)
-		return false, reasonRevoked
-	}
-
-	// appResolver 解析目的为 resource(本租户域内;无匹配 → 无可授权资源 → deny,默认拒绝)。
+	// 首流(或缓存过期):appResolver 解析目的为 resource(本租户域内;无匹配 → 无可授权资源 → deny,默认拒绝)。
 	appKey, ok := tm.apps.Resolve(ts.tenant, t.DstIP, t.DstPort)
 	if !ok {
 		// 不缓存 deny(目的可能后续被 appResolver 配置;且无 appKey 即无流定义)。计 ztna_no_app。
+		// 顺序说明(reviewer B2):本路径 resolve 先于吊销检查——已撤销 session 若只发往 no-app 目的,
+		// 不在此被新流闸拆除(该流本就 deny、数据不出);撤销的权威拆除靠 EvictRevoked 主路径(撤销下发回调
+		// 遍历全表)+ session deadline 兜底,二者不依赖"恰有一个 no-app 新流来触发"。发往有效 app 的新流仍
+		// 在下方 decideResource 第①步命中吊销并拆 session。故顺序调整非安全回归。
 		return false, reasonNoApp
 	}
 
-	// PEP 裁决(复用 pep.Decide,连接级缓存;权威在 PoP,默认拒绝)。
-	bundle, has := tm.bundles.Get(ts.tenant)
-	var bp *xdsv1.PolicyBundle
-	if has {
-		bp = &bundle
+	// 新流闸查吊销 + PEP 裁决(与透明代理路径同一逻辑 decideResource,零行为漂移)。
+	allow, effect, reason := tm.decideResource(ts, appKey)
+	if reason == reasonRevoked {
+		// 撤销命中已在 decideResource 拆 session;不缓存(session 已亡)。
+		return false, reasonRevoked
 	}
-	effect := pep.Decide(bp, ts.claims, appKey, "connect")
-	allow := effect != xdsv1.EffectDeny // inspect 第一刀 = allow(见函数注释)
 
 	ts.mu.Lock()
 	ts.flows[key] = flowVerdict{allow: allow, expire: now.Add(flowCacheTTL)}
@@ -156,6 +148,38 @@ func (tm *Terminator) decide(ts *termSession, t fiveTuple) (bool, string) {
 	}
 	log.Printf("[ztnaterm] %s tenant=%s sub=%s app=%s dst=%s:%d", effect, ts.tenant, ts.claims.Subject, appKey, t.DstIP, t.DstPort)
 	return true, ""
+}
+
+// decideResource 是「新流闸查吊销 + pep.Decide」的连接级授权裁决(§3.4.1 安全核心):
+// 包路径(decide)与透明代理路径(RunRedirectProxy)共用此函数,**同一逻辑零行为漂移**。
+//
+// 流程:① 新流闸(§3.1)查吊销(复用握手时存的 ts.claims.JTI;同 session 内 jti 不变,不重解析凭证)
+// → 命中即主动拆 session(长连权威闭合的兜底,返 reasonRevoked);② pep.Decide(复用纯函数,权威在 PoP,
+// 默认拒绝)→ inspect 第一刀 = allow。返回 (allow, effect, dropReason);effect 供调用方日志(与重构前一致)。
+//
+// 注:**不做流缓存**(缓存是包路径 decide 的职责;透明代理是 OS 级连接,每连接调一次,无需 mux 内缓存)。
+func (tm *Terminator) decideResource(ts *termSession, appKey string) (allow bool, effect, reason string) {
+	// ① 新流闸:查吊销。命中 → 主动拆 session(不只拒本流)——长连权威闭合的兜底(主路径是 EvictRevoked 回调)。
+	if tm.revoked != nil && tm.revoked.IsRevoked(ts.tenant, ts.claims.JTI) {
+		tm.mu.RLock()
+		srcKey := ts.srcAddr.String()
+		tm.mu.RUnlock()
+		tm.evictSession(srcKey, ts, reasonRevoked)
+		return false, "", reasonRevoked
+	}
+
+	// ② PEP 裁决(复用 pep.Decide;权威在 PoP,默认拒绝)。
+	bundle, has := tm.bundles.Get(ts.tenant)
+	var bp *xdsv1.PolicyBundle
+	if has {
+		bp = &bundle
+	}
+	effect = pep.Decide(bp, ts.claims, appKey, "connect")
+	allow = effect != xdsv1.EffectDeny // inspect 第一刀 = allow
+	if !allow {
+		return false, effect, reasonPEPDeny
+	}
+	return true, effect, ""
 }
 
 // learnInnerIP 记录 Agent 内层源 IP → session(回程定位)。已记录则 no-op。

@@ -11,6 +11,7 @@ import (
 	"context"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -31,8 +32,14 @@ func run() error {
 	popAddr := envMust("POP_CONNECTOR_ADDR")
 	tenant := envMust("TENANT")
 	app := envMust("APP")
-	upstream := envMust("UPSTREAM_URL")
 	tlsDir := envOr("SASE_TLS_DIR", "./certs")
+	mode := envOr("MODE", revtunnel.ModeHTTP) // http(缺省,W1)/ stream(Slice78 零暴露原始 TCP 流)
+	// http 模式上游 = UPSTREAM_URL(http://host:port);stream 模式上游 = UPSTREAM(host:port,net.Dial)。
+	// 各模式只校验自己需要的上游 env(下方分支内 envMust),此处不强求。
+	var upstream string
+	if mode != revtunnel.ModeStream {
+		upstream = envMust("UPSTREAM_URL")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -49,6 +56,23 @@ func run() error {
 		renewURL := envOr("DEVICE_URL", "https://localhost:8444")
 		go enroll.RunRenewLoop(ctx, rotator, renewURL, tlsDir, "localhost", app, 8*time.Hour)
 	}
+
+	// stream 模式(Slice78):原始 TCP 流承载。PoP 终结透明代理流后经 OpenStream 反向送本地上游(UPSTREAM host:port)。
+	if mode == revtunnel.ModeStream {
+		streamUpstream := envMust("UPSTREAM") // host:port(net.Dial),区别于 http 模式的 UPSTREAM_URL
+		log.Printf("[connector] tenant=%s app=%s 拨出 PoP %s(mTLS,stream 模式),上游 %s", tenant, app, popAddr, streamUpstream)
+		dial := func(dst string) (net.Conn, error) {
+			// 第一刀:connector 绑定单一上游 UPSTREAM,忽略 PoP 透传的 dst(dst 仅作可观测;多上游路由后续刀)。
+			_ = dst
+			return (&net.Dialer{}).DialContext(ctx, "tcp", streamUpstream)
+		}
+		serveLoop(ctx, connMaxAge(), func(connCtx context.Context) error {
+			return revtunnel.ServeStream(connCtx, popAddr, tlsConf, revtunnel.Hello{Tenant: tenant, App: app}, dial)
+		})
+		return nil
+	}
+
+	// http 模式(W1,缺省):字节级不动。
 	log.Printf("[connector] tenant=%s app=%s 拨出 PoP %s(mTLS),上游 %s", tenant, app, popAddr, upstream)
 	handler := func(req revtunnel.Request) revtunnel.Response {
 		return proxy(ctx, upstream, req)

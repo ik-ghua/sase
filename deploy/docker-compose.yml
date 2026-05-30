@@ -105,7 +105,13 @@ services:
     user: "0:0"
     restart: "no"
 
-  # ---- internal-app:私网内部应用(echo-app,固定 IP;Slice77 ZTNA 到达目标) ----
+  # ---- internal-app:私网内部应用(echo-app)——Slice78 零暴露:仅在 appnet,无对外入站、PoP 不可直连 ----
+  # 关键变化(Slice78 vs Slice77):internal-app **移出 default 网**,只接 appnet,且**不映射任何 ports**。
+  #   → PoP(在 default 网)到 internal-app 无路由(`wget internal-app` UNREACHABLE,证「PoP 不直连 app」);
+  #   → 外部无任何入站开口(无 ports;证「app 无对外入站」);
+  #   → 唯一到达路径 = connector(同时接 appnet+default)主动拨出注册到 PoP,PoP 经 revtunnel 反向流送达。
+  # Agent 侧仍以 10.123.0.50:9000 作**虚拟目的**(INTERNAL_CIDR/appResolver 据此映射);该 VIP 不再是 PoP
+  # 可达的真实 IP,而是经 SO_ORIGINAL_DST 透传给 connector → connector dial 真实上游 internal-app:9000(appnet)。
   internal-app:
     build:
       context: ..
@@ -116,8 +122,7 @@ services:
       ADDR: ":9000"
       NAME: internal-app
     networks:
-      default:
-        ipv4_address: 10.123.0.50   # 固定 IP:Agent 的 INTERNAL_CIDR/appResolver 据此映射
+      appnet:        # 仅私网(appnet);不接 default、不映射 ports → 零暴露面
 
   # ---- api-server:控制面/管理面 ----
   api-server:
@@ -242,9 +247,14 @@ services:
       ZTNA_DATA_ADV: "pop-agent:7300"     # 通告给 Agent 的 PoP 数据面地址(服务名:端口)
       ZTNA_TUNNEL_ALG: ${SDWAN_TUNNEL_ALG:-chacha20poly1305}
       ZTNA_TUN: saze0                     # PoP-TUN 名(pop-entrypoint 据此配 IP/路由)
-      # appResolver:目的(tenant=cidr=appKey)→ PEP resource。internal-app(10.123.0.50)→ "internal-app"(allow);
-      # secret(10.123.0.60)→ "secret-app"(seed bundle 无规则 → default-deny,演示 deny 路径)。
-      ZTNA_APP_RESOLVE: "${DEMO_TENANT_ID:-11111111-1111-1111-1111-111111111111}=10.123.0.50/32=internal-app;${DEMO_TENANT_ID:-11111111-1111-1111-1111-111111111111}=10.123.0.60/32=secret-app"
+      # appResolver:目的(tenant=cidr=appKey[@connector])→ PEP resource。
+      #   internal-app(10.123.0.50)→ "internal-app@connector"(allow + **走零暴露 connector 反向出站**,Slice78);
+      #   secret(10.123.0.60)→ "secret-app"(seed bundle 无规则 → default-deny,演示 deny 路径)。
+      ZTNA_APP_RESOLVE: "${DEMO_TENANT_ID:-11111111-1111-1111-1111-111111111111}=10.123.0.50/32=internal-app@connector;${DEMO_TENANT_ID:-11111111-1111-1111-1111-111111111111}=10.123.0.60/32=secret-app"
+      # Slice78 零暴露透明代理:REDIRECT listener 端口 + 被 REDIRECT 的 connector-backed CIDR(与 @connector 同源对齐)。
+      # pop-entrypoint 据 ZTNA_REDIRECT_CIDRS 配 iptables -t nat PREROUTING -i $ZTNA_TUN -p tcp -d <cidr> -j REDIRECT --to-ports $ZTNA_PROXY_PORT。
+      ZTNA_PROXY_PORT: "7350"
+      ZTNA_REDIRECT_CIDRS: "10.123.0.50/32"
       # pop-entrypoint 配 PoP-TUN IP(回程网段)+ SNAT(出口 eth0,源 = Agent 内层网段)。
       ZTNA_POP_TUN_ADDR: "10.88.0.1/24"
       ZTNA_EGRESS_IF: eth0
@@ -387,15 +397,60 @@ services:
       - certs:/certs:ro
       - ./agent-entrypoint.sh:/agent-entrypoint.sh:ro
 
+  # ---- connector:App Connector(Slice78 零暴露面出站)----
+  # 经 ZTP 取租户绑定证书(tenant=Org / CN=internal-app)→ MODE=stream 拨向 pop-agent:7000 注册
+  # Hello{tenant, app="internal-app", mode=stream}(register 顶端 W9 校验证书租户==Hello.tenant)。
+  # PoP ZTNA 透明代理对 connector-backed 流经 OpenStream(tenant,"internal-app",dst) 反向送本 connector,
+  # connector net.Dial 真实上游 UPSTREAM=internal-app:9000(appnet)。**同时接 appnet(到 app)+ default(拨 PoP)**。
+  # 这是 internal-app 唯一的到达路径(app 无入站开口、PoP 不直连 app)。
+  connector:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        CMD: connector
+    depends_on:
+      api-server:
+        condition: service_healthy   # ZTP /enroll 在管理面 HTTPS
+      pop-agent:
+        condition: service_started
+      internal-app:
+        condition: service_started
+    environment:
+      TENANT: ${DEMO_TENANT_ID:-11111111-1111-1111-1111-111111111111}
+      # APP = revtunnel 注册键 + ZTP 证书 CN(须与 seed connector 入网 identity 一致 + 与 PoP appResolver appKey 一致)。
+      APP: internal-app
+      MODE: stream                    # Slice78 原始 TCP 流承载(非 http RoundTrip)
+      # stream 模式上游 = host:port(net.Dial);connector 在 appnet 上经服务名直达 internal-app。
+      UPSTREAM: internal-app:9000
+      ZTP_CODE: ${CONNECTOR_ZTP_CODE:-11111111-1111-1111-1111-111111111111.dddddddddddddddddddddddddddddddd}
+      MGMT_URL: https://api-server:8443
+      DEVICE_URL: https://api-server:8444
+      POP_CONNECTOR_ADDR: pop-agent:7000   # PoP 反向注册口(mTLS)
+      SASE_TLS_DIR: /certs
+    networks:
+      - appnet     # 到内部 app(internal-app)
+      - default    # 拨向 pop-agent 注册口(default 网)
+    volumes:
+      - certs:/certs:ro
+
 volumes:
   pgdata:
   certs:
 
-# 固定子网(默认网络):使 internal-app 能取静态 IP(10.123.0.50),Agent 据此设 INTERNAL_CIDR、
-# appResolver 据此映射 resource;PoP 出站 SNAT 后内核可在本网段内直达 internal-app(Slice77 §3.4 b)。
+# 网络拓扑(Slice78 零暴露):
+#   default —— 控制/数据面公共网(api/xds/pop-agent/agent/cpe/connector 拨号侧);Agent 以 10.123.0.50 作虚拟目的。
+#   appnet  —— 私网应用段:仅 internal-app + connector 在此;internal-app 无 ports、PoP 不在此网 → 零暴露面。
+# Agent 侧 10.123.0.50 是**虚拟目的**(经隧道→PoP REDIRECT→connector),非 default 上的真实 IP;故 default
+# 仍声明 10.123.0.0/16 子网(Agent INTERNAL_CIDR/appResolver 据此映射),但该 VIP 不分配给任何 default 容器。
 networks:
   default:
     ipam:
       config:
         - subnet: 10.123.0.0/16
           gateway: 10.123.0.1
+  appnet:
+    internal: true   # 私网段:无外部路由(纵深;app 唯一出入 = connector 反向流)
+    ipam:
+      config:
+        - subnet: 10.200.0.0/24

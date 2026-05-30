@@ -26,6 +26,7 @@ import (
 	"github.com/ikuai8/sase/internal/dptunnel"
 	"github.com/ikuai8/sase/internal/metrics"
 	"github.com/ikuai8/sase/internal/pop"
+	"github.com/ikuai8/sase/internal/revtunnel"
 )
 
 // defaultSessionCap 是 session deadline 上限(claims.Exp 与本上限取小)。参照 SD-WAN connMaxAge=1h:
@@ -43,6 +44,14 @@ const (
 	reasonExpired     = "ztna_expired"  // session deadline 到期
 	reasonTUNWrite    = "ztna_tun_write"
 	reasonSealFail    = "seal_fail" // 回程 Seal 失败
+
+	// 透明代理(Slice78 零暴露面出站)专属 reason(低基数)。
+	reasonProxyNoSession   = "ztna_proxy_no_session"   // accept 后 lookupInnerIP 找不到(无握手 → fail-closed)
+	reasonProxyOrigDstFail = "ztna_proxy_origdst_fail" // SO_ORIGINAL_DST 取原目的失败
+	reasonProxyNoApp       = "ztna_proxy_no_app"       // 原目的解析不出 resource(本租户域内无规则)
+	reasonProxyDeny        = "ztna_proxy_deny"         // 透明代理处连接级 PEP deny
+	reasonNoConnector      = "ztna_no_connector"       // 无已注册 connector(OpenStream 返 ErrNoConnector)
+	reasonProxyEstablished = "ztna_proxy_established"  // 透明代理流建立(出站成功;非 drop,经 TunnelDrop 复用计数)
 )
 
 // flowVerdict 是一条流的缓存裁决(连接级缓存,避免逐包重判;§3.3)。
@@ -72,7 +81,8 @@ type Terminator struct {
 	bundles  *pop.BundleStore
 	revoked  *pop.RevocationStore
 	apps     *AppResolver
-	tun      dptunnel.PacketIO // PoP 侧 TUN(allow 内层包写入 → 内核 SNAT 出站;回程从此读)
+	tun      dptunnel.PacketIO   // PoP 侧 TUN(allow 内层包写入 → 内核 SNAT 出站;回程从此读)
+	reg      *revtunnel.Registry // 连接器注册表(Slice78 零暴露面出站:透明代理经 OpenStream 反向送 app);可 nil
 	rec      *metrics.Recorder
 	now      func() time.Time
 	cap      time.Duration
@@ -100,6 +110,26 @@ func New(verifier *cred.Verifier, bundles *pop.BundleStore, revoked *pop.Revocat
 		bySrc:     map[string]*termSession{},
 		byInnerIP: map[string]*termSession{},
 	}
+}
+
+// WithRegistry 挂 connector 注册表(Slice78 零暴露面出站):透明代理对 connector-backed 流经
+// reg.OpenStream 反向送内部 app(私网零入站开口)。返回自身便于链式。reg 可为 nil(则透明代理对所有
+// 流因无 connector 关连接)。
+func (tm *Terminator) WithRegistry(reg *revtunnel.Registry) *Terminator {
+	tm.reg = reg
+	return tm
+}
+
+// lookupInnerIP 按 Agent 内层源 IP 查终结表项(透明代理 accept 后的 fail-closed 定位,§3.4.1)。
+// 找不到 → (nil, false):无有效 dptunnel 握手 → 无 byInnerIP 表项 → 无 principal → 调用方关连接。
+func (tm *Terminator) lookupInnerIP(ip net.IP) (*termSession, bool) {
+	if ip == nil {
+		return nil, false
+	}
+	tm.mu.RLock()
+	ts, ok := tm.byInnerIP[ip.String()]
+	tm.mu.RUnlock()
+	return ts, ok
 }
 
 // VerifyCred 是供 tunhandshake.NewServerWithCred 的 hook(§3.1 入口闸):验签 + 有效期(cred.Verify)+

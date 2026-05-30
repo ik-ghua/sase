@@ -12,6 +12,10 @@
 #                     使回程包(dst=Agent 内层 IP)经路由进 TUN 被终结器读到、Seal 回 Agent。
 #   ZTNA_EGRESS_IF    出口网卡名(SNAT 经此出站到 app,默认 eth0)。
 #   ZTNA_AGENT_CIDR   Agent 内层源网段(MASQUERADE 限定源,默认 = ZTNA_POP_TUN_ADDR 的网段)。
+# 可选 env(Slice78 零暴露透明代理):
+#   ZTNA_PROXY_PORT     透明代理 listener 端口(与 pop-agent 的 ZTNA_PROXY_PORT 一致)。
+#   ZTNA_REDIRECT_CIDRS 逗号分隔的 connector-backed CIDR;到这些目的的 TCP 经 iptables REDIRECT 到 ZTNA_PROXY_PORT
+#                       由透明代理终结(连接级 PEP + connector 反向出站),不走 PoP-TUN SNAT。
 set -eu
 
 : "${ZTNA_TUN:?须设 ZTNA_TUN(PoP-TUN 名,如 saze0)}"
@@ -34,7 +38,8 @@ iptables -t nat -C POSTROUTING -s "$AGENT_CIDR" -o "$EGRESS_IF" -j MASQUERADE 2>
   iptables -t nat -A POSTROUTING -s "$AGENT_CIDR" -o "$EGRESS_IF" -j MASQUERADE 2>/dev/null || \
   echo "[pop-entrypoint] 警告:配置 MASQUERADE 失败(出站源 NAT 可能不通)" >&2
 
-# 后台轮询器:等 PoP-TUN 出现(pop-agent 启动即开)→ 配 IP(给 Agent 内层网段的回程路由)→ up。
+# 后台轮询器:等 PoP-TUN 出现(pop-agent 启动即开)→ 配 IP(给 Agent 内层网段的回程路由)→ up →
+# (Slice78)给 connector-backed CIDR 配 REDIRECT 透明代理规则。
 (
   i=0
   until ip link show "$ZTNA_TUN" >/dev/null 2>&1; do
@@ -51,6 +56,28 @@ iptables -t nat -C POSTROUTING -s "$AGENT_CIDR" -o "$EGRESS_IF" -j MASQUERADE 2>
   echo "[pop-entrypoint] PoP-TUN 就绪;SNAT 源=$AGENT_CIDR 出口=$EGRESS_IF:"
   ip -br addr show "$ZTNA_TUN" || true
   iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -i masq || true
+
+  # Slice78 零暴露透明代理:把 connector-backed CIDR 的 TCP REDIRECT 到本地 ZTNA_PROXY_PORT。
+  # REDIRECT 改目的为 127.0.0.1:<port>;入向 TUN 的包目的是非本地 IP(VIP),内核默认不路由到 lo,
+  # 故须对 TUN 开 route_localnet=1(允许把目的视为本地回环路由)。仅命名空间内生效。
+  if [ -n "${ZTNA_PROXY_PORT:-}" ] && [ -n "${ZTNA_REDIRECT_CIDRS:-}" ]; then
+    sysctl -w "net.ipv4.conf.${ZTNA_TUN}.route_localnet=1" 2>/dev/null || \
+      echo 1 > "/proc/sys/net/ipv4/conf/${ZTNA_TUN}/route_localnet" 2>/dev/null || \
+      echo "[pop-entrypoint] 警告:开 ${ZTNA_TUN}.route_localnet 失败(REDIRECT 可能不通)" >&2
+    # all.route_localnet 兜底(部分内核 REDIRECT 经 all 生效)。
+    sysctl -w "net.ipv4.conf.all.route_localnet=1" 2>/dev/null || true
+    OLDIFS="$IFS"; IFS=','
+    for cidr in $ZTNA_REDIRECT_CIDRS; do
+      cidr="$(echo "$cidr" | tr -d ' ')"
+      [ -z "$cidr" ] && continue
+      iptables -t nat -C PREROUTING -i "$ZTNA_TUN" -p tcp -d "$cidr" -j REDIRECT --to-ports "$ZTNA_PROXY_PORT" 2>/dev/null || \
+        iptables -t nat -A PREROUTING -i "$ZTNA_TUN" -p tcp -d "$cidr" -j REDIRECT --to-ports "$ZTNA_PROXY_PORT" 2>/dev/null || \
+        echo "[pop-entrypoint] 警告:配置 REDIRECT $cidr → :$ZTNA_PROXY_PORT 失败" >&2
+      echo "[pop-entrypoint] 零暴露 REDIRECT:$cidr (tcp) → 透明代理 :$ZTNA_PROXY_PORT"
+    done
+    IFS="$OLDIFS"
+    iptables -t nat -L PREROUTING -n 2>/dev/null | grep -i redirect || true
+  fi
 ) &
 
 echo "[pop-entrypoint] exec pop-agent(PID 1);ZTNA 终结器启动后将创建 PoP-TUN=$ZTNA_TUN,后台轮询器随后配 IP"
