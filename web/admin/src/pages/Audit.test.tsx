@@ -147,6 +147,69 @@ describe('Audit 页', () => {
     expect(screen.getByText('INSERT pop_nodes')).toBeInTheDocument();
   });
 
+  it('关键词命中 actor_subject 子串→只剩匹配行', async () => {
+    // 三条:apiEntry/errEntry actor_subject=ops-alice;dataEntry 改为 ops-bob 便于区分
+    const bobEntry = { ...dataEntry, actor_subject: 'ops-bob' };
+    mockGET.mockResolvedValueOnce({
+      data: [apiEntry, bobEntry, errEntry],
+      response: { ok: true, status: 200 },
+    });
+    renderWith();
+    await waitFor(() =>
+      expect(screen.getByText('POST /api/v1/platform/pop-nodes')).toBeInTheDocument(),
+    );
+    // 输入 actor_subject 子串「bob」(大小写不敏感)
+    fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'BOB' } });
+    // 仅 bob 的行保留;两条 alice 行被过滤
+    await waitFor(() =>
+      expect(screen.queryByText('POST /api/v1/platform/pop-nodes')).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByText('PATCH /api/v1/tenants/{tid}')).not.toBeInTheDocument();
+    expect(screen.getByText('INSERT pop_nodes')).toBeInTheDocument();
+  });
+
+  it('关键词命中 action 子串→只剩匹配行', async () => {
+    mockGET.mockResolvedValueOnce({
+      data: [apiEntry, dataEntry, errEntry],
+      response: { ok: true, status: 200 },
+    });
+    renderWith();
+    await waitFor(() =>
+      expect(screen.getByText('INSERT pop_nodes')).toBeInTheDocument(),
+    );
+    // 输入 action 子串「insert」(大小写不敏感,actor_subject 均为 ops-alice 不含此串)
+    fireEvent.change(screen.getByRole('searchbox'), { target: { value: 'insert' } });
+    await waitFor(() =>
+      expect(screen.queryByText('POST /api/v1/platform/pop-nodes')).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByText('PATCH /api/v1/tenants/{tid}')).not.toBeInTheDocument();
+    expect(screen.getByText('INSERT pop_nodes')).toBeInTheDocument();
+  });
+
+  it('清空关键词→恢复全部行', async () => {
+    mockGET.mockResolvedValueOnce({
+      data: [apiEntry, dataEntry, errEntry],
+      response: { ok: true, status: 200 },
+    });
+    renderWith();
+    await waitFor(() =>
+      expect(screen.getByText('INSERT pop_nodes')).toBeInTheDocument(),
+    );
+    const box = screen.getByRole('searchbox');
+    // 先过滤掉只剩触发器行
+    fireEvent.change(box, { target: { value: 'insert' } });
+    await waitFor(() =>
+      expect(screen.queryByText('POST /api/v1/platform/pop-nodes')).not.toBeInTheDocument(),
+    );
+    // 清空 → 全部行恢复
+    fireEvent.change(box, { target: { value: '' } });
+    await waitFor(() =>
+      expect(screen.getByText('POST /api/v1/platform/pop-nodes')).toBeInTheDocument(),
+    );
+    expect(screen.getByText('PATCH /api/v1/tenants/{tid}')).toBeInTheDocument();
+    expect(screen.getByText('INSERT pop_nodes')).toBeInTheDocument();
+  });
+
   it('detail 展开:展开行显示完整 detail + 概览 Descriptions', async () => {
     mockGET.mockResolvedValueOnce({
       data: [apiEntry],
