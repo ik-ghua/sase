@@ -99,6 +99,51 @@ func TestHTTPMiddleware(t *testing.T) {
 	}
 }
 
+// Slice60 待后续②:设备面 recorder 用 sase_device_* 指标名区分管理面 sase_api_*。
+func TestDeviceRecorderMetricNames(t *testing.T) {
+	dev := NewDeviceRecorder()
+	dev.Observe("POST", "POST /api/v1/renew", 200, 2*time.Millisecond)
+	rr := httptest.NewRecorder()
+	dev.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rr.Body.String()
+	if !strings.Contains(body, "sase_device_requests_total") {
+		t.Fatalf("设备面 /metrics 应含 sase_device_requests_total,得:\n%s", body)
+	}
+	if !strings.Contains(body, "sase_device_request_duration_seconds") {
+		t.Fatalf("设备面 /metrics 应含 sase_device_request_duration_seconds,得:\n%s", body)
+	}
+	// 与管理面区分:设备面 registry 不应出现 sase_api_* 序列。
+	if strings.Contains(body, "sase_api_requests_total") {
+		t.Fatalf("设备面 /metrics 不应含管理面 sase_api_*(指标名应区分两面),得:\n%s", body)
+	}
+}
+
+// Slice60 待后续②:设备面中间件经真实 http.ServeMux 模板化 route(镜像 main.go 的 devMux.Handler(r))
+// + 截获被拒请求(401/403)的状态码 + 计数。
+func TestDeviceHTTPMiddleware(t *testing.T) {
+	dev := NewDeviceRecorder()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/renew", func(w http.ResponseWriter, _ *http.Request) {
+		// 模拟设备面:无客户端证书 → 401(被拒请求也须计量,故中间件包最外层)。
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	// routeOf 取注册的 mux 路由模板(与 main.go 一致);未匹配的请求模板为空 → 中间件兜底 "other"。
+	routeOf := func(r *http.Request) string { _, pat := mux.Handler(r); return pat }
+	h := HTTPMiddleware(dev, routeOf)(mux)
+
+	// 命中模板路由(被拒 401 仍计量)。
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/api/v1/renew", nil))
+	if got := dev.RequestCount("POST", "POST /api/v1/renew", 401); got != 1 {
+		t.Fatalf("设备面 /renew 401 应 1(被拒请求须计量),得 %v", got)
+	}
+
+	// 未注册路径:ServeMux 返 404 + 空模板 → route 兜底 "other"。
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/api/v1/unknown", nil))
+	if got := dev.RequestCount("GET", "other", 404); got != 1 {
+		t.Fatalf("未注册路径应记为 other 404,得 %v", got)
+	}
+}
+
 // Slice67:隧道丢包按 reason 计数 + nil no-op。
 func TestTunnelDrop(t *testing.T) {
 	r := NewRecorder()

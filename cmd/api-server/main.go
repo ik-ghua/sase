@@ -257,7 +257,16 @@ func run() error {
 		}
 		devMux := http.NewServeMux()
 		httpapi.RegisterDevice(devMux, enrollSvc, renewLimiter)
-		devSrv := &http.Server{Handler: devMux, ReadHeaderTimeout: 5 * time.Second}
+		// Slice60 待后续②:设备面 :8444 HTTP RED 指标。device recorder 用 sase_device_* 指标名
+		// 区分管理面 sase_api_*;route 取注册的 mux 路由模板(devMux.Handler(r) → 如 "POST /api/v1/renew")
+		// **不打真实路径/设备 ID/tenant 等高基数标签**(严守 Slice60 基数控制)。
+		// 中间件包在 devMux 最外层 → 含被拒(401/403/429)请求也计量。
+		devRec := metrics.NewDeviceRecorder()
+		devRouteOf := func(r *http.Request) string { _, pat := devMux.Handler(r); return pat }
+		var devHandler http.Handler = metrics.HTTPMiddleware(devRec, devRouteOf)(devMux)
+		// 设备面 /metrics 与管理面分端口暴露(各自独立 registry;明文内部抓取,客户不可见)。
+		go serveMetrics(ctx, envOr("SASE_DEVICE_METRICS_ADDR", ":9101"), devRec.Handler())
+		devSrv := &http.Server{Handler: devHandler, ReadHeaderTimeout: 5 * time.Second}
 		ln, lerr := tls.Listen("tcp", devAddr, devTLS) // 产 *tls.Conn,http.Server 自动握手并填 r.TLS
 		if lerr != nil {
 			return fmt.Errorf("设备端点监听 %s: %w", devAddr, lerr)

@@ -181,25 +181,40 @@ func (r *ControlRecorder) XDSPushValue(resource string) float64 {
 	return m.GetCounter().GetValue()
 }
 
-// APIRecorder 持管理面(Admin API)HTTP RED 指标(请求计数 + 时延直方图;运维 L2 3.4/3.10,L1 2.2 SLO 前置)。
-// **基数控制**:route 用注册的 mux 路由模板(如 "GET /api/v1/tenants/{tid}/users",27 个,非真实路径)、
-// **不打 tenant**;code 为 HTTP 状态码(有界 ~十几种)。nil 方法 no-op。
+// APIRecorder 持 HTTP RED 指标(请求计数 + 时延直方图;运维 L2 3.4/3.10,L1 2.2 SLO 前置)。
+// **基数控制**:route 用注册的 mux 路由模板(如 "GET /api/v1/tenants/{tid}/users",非真实路径)、
+// **不打 tenant/设备 ID 等高基数标签**;code 为 HTTP 状态码(有界 ~十几种)。nil 方法 no-op。
+//
+// 通过 subsystem 区分接入面:管理面(Admin API,subsystem="api" → sase_api_*)与
+// 设备面(ZTP :8444 /renew,subsystem="device" → sase_device_*)用不同的指标名,
+// 即便同端口/同 registry 抓取也不会混淆(Slice60 待后续②)。
 type APIRecorder struct {
 	reg      *prometheus.Registry
 	requests *prometheus.CounterVec
 	duration *prometheus.HistogramVec
 }
 
-// NewAPIRecorder 构造带独立 registry 的管理面 HTTP 指标记录器。
+// NewAPIRecorder 构造带独立 registry 的管理面(Admin API)HTTP 指标记录器(指标名 sase_api_*)。
 func NewAPIRecorder() *APIRecorder {
+	return newAPIRecorder("api", "管理面")
+}
+
+// NewDeviceRecorder 构造带独立 registry 的设备面(ZTP :8444 /renew 等)HTTP 指标记录器
+// (指标名 sase_device_*,与管理面 sase_api_* 区分;Slice60 待后续②)。
+func NewDeviceRecorder() *APIRecorder {
+	return newAPIRecorder("device", "设备面")
+}
+
+// newAPIRecorder 按 subsystem 构造 HTTP RED 记录器(管理面/设备面共用,仅指标名前缀不同)。
+func newAPIRecorder(subsystem, planeDesc string) *APIRecorder {
 	reg := prometheus.NewRegistry()
 	requests := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "sase", Subsystem: "api", Name: "requests_total",
-		Help: "管理面 HTTP 请求数(按方法/路由模板/状态码)",
+		Namespace: "sase", Subsystem: subsystem, Name: "requests_total",
+		Help: planeDesc + " HTTP 请求数(按方法/路由模板/状态码)",
 	}, []string{"method", "route", "code"})
 	duration := prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: "sase", Subsystem: "api", Name: "request_duration_seconds",
-		Help:    "管理面 HTTP 请求时延秒(按方法/路由模板)",
+		Namespace: "sase", Subsystem: subsystem, Name: "request_duration_seconds",
+		Help:    planeDesc + " HTTP 请求时延秒(按方法/路由模板)",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"method", "route"})
 	reg.MustRegister(requests, duration)
