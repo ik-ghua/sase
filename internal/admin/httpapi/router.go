@@ -680,7 +680,8 @@ func createApp(svc resource.Service) http.HandlerFunc {
 			return
 		}
 		if err := svc.CreateApp(r.Context(), r.PathValue("tid"), &a); err != nil {
-			writeInternalErr(w, "createApp", err)
+			// 错误码治理(Slice73):校验错→400、app_key 唯一冲突→409、DB/内部错→500 脱敏。
+			writeValidationOr500(w, "createApp", err, resource.ErrInvalidResource)
 			return
 		}
 		writeJSON(w, http.StatusCreated, a)
@@ -705,7 +706,8 @@ func createConnector(svc resource.Service) http.HandlerFunc {
 			return
 		}
 		if err := svc.CreateConnector(r.Context(), r.PathValue("tid"), &c); err != nil {
-			writeInternalErr(w, "createConnector", err)
+			// 错误码治理(Slice73):校验错→400、唯一冲突→409(connectors 无 UNIQUE,实际不触发,留作纵深)、DB/内部错→500 脱敏。
+			writeValidationOr500(w, "createConnector", err, resource.ErrInvalidResource)
 			return
 		}
 		writeJSON(w, http.StatusCreated, c)
@@ -947,7 +949,8 @@ func createSite(svc site.Service) http.HandlerFunc {
 			return
 		}
 		if err := svc.CreateSite(r.Context(), r.PathValue("tid"), &s); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			// 错误码治理(Slice73):校验错→400、site_key 唯一冲突→409、DB/内部错→500 脱敏。
+			writeValidationOr500(w, "createSite", err, site.ErrInvalidSite)
 			return
 		}
 		writeJSON(w, http.StatusCreated, s)

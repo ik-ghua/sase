@@ -9,12 +9,15 @@ package httpapi_test
 //   ⑤ RLS 隔离实证:tA 列表绝不含 tB 的站点。
 //   ⑥ 空租户 → 200 + 空数组 [](非 null)。
 //   ⑦ POST 拒 v4-mapped-v6 CIDR → 400(输入侧纵深,承接 Slice70)。
+//   ⑧ 错误码治理(Slice73):POST 非法 CIDR → 400 + 回显安全校验文案(含 ErrInvalidSite 文案,不含原始 DB 细节);
+//      POST 缺字段 → 400;POST site_key 唯一冲突 → 409(非 400 误报);POST 触发 DB 错(非法 tid)→ 500 脱敏(不直出底层 err)。
 
 import (
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,5 +181,55 @@ func TestSitesEndpoint(t *testing.T) {
 		map[string]string{"site_key": "mapped", "name": "v4mapped", "cidr": "::ffff:10.0.0.0/104"})
 	if st != http.StatusBadRequest {
 		t.Fatalf("POST v4-mapped CIDR 应 400,得 %d body=%s", st, body)
+	}
+
+	// ⑧ 错误码治理(Slice73)。
+	// (a) 非法 CIDR(net.ParseCIDR 解析失败)→ 400 + 回显安全校验文案。
+	st, body = doRaw(t, srv.URL, taTok, "POST", "/api/v1/tenants/"+tA+"/sites",
+		map[string]string{"site_key": "bad-cidr", "name": "x", "cidr": "10.0.0.0/99"})
+	if st != http.StatusBadRequest {
+		t.Fatalf("POST 非法 CIDR 应 400,得 %d body=%s", st, body)
+	}
+	// 校验文案对调用方有用且安全:应含 site 校验提示(ErrInvalidSite 文案)且不含底层 DB/驱动细节。
+	if !strings.Contains(string(body), "非法") {
+		t.Fatalf("400 响应应回显校验文案(含\"非法\"),得 %q", string(body))
+	}
+	if strings.Contains(string(body), "internal error") {
+		t.Fatalf("非法 CIDR 应是 400 校验错,不应是 500 脱敏文案,得 %q", string(body))
+	}
+
+	// (b) 缺字段(无 site_key)→ 400。
+	st, body = doRaw(t, srv.URL, taTok, "POST", "/api/v1/tenants/"+tA+"/sites",
+		map[string]string{"name": "no-key", "cidr": "10.0.9.0/24"})
+	if st != http.StatusBadRequest {
+		t.Fatalf("POST 缺 site_key 应 400,得 %d body=%s", st, body)
+	}
+
+	// (c) site_key 唯一冲突 → 409(非 400 误报、非 500)。
+	// 先建一个,再用同 site_key 重复建。
+	st, body = doRaw(t, srv.URL, taTok, "POST", "/api/v1/tenants/"+tA+"/sites",
+		map[string]string{"site_key": "dup-key", "name": "first", "cidr": "10.2.1.0/24"})
+	if st != http.StatusCreated {
+		t.Fatalf("首次建 dup-key 应 201,得 %d body=%s", st, body)
+	}
+	st, body = doRaw(t, srv.URL, taTok, "POST", "/api/v1/tenants/"+tA+"/sites",
+		map[string]string{"site_key": "dup-key", "name": "second", "cidr": "10.2.2.0/24"})
+	if st != http.StatusConflict {
+		t.Fatalf("重复 site_key 应 409(唯一冲突),得 %d body=%s", st, body)
+	}
+	if strings.Contains(string(body), "duplicate key") || strings.Contains(string(body), "uq_sites") {
+		t.Fatalf("409 响应不应泄漏底层约束/SQLSTATE 细节,得 %q", string(body))
+	}
+
+	// (d) DB 错路径 → 500 脱敏。非法 tid(非 UUID)使 INSERT 的 tenant_id 类型转换在 DB 层失败,
+	// svc.CreateSite 返回的是 DB 错(未包 ErrInvalidSite),应归 500 且不直出底层 err。
+	st, body = doRaw(t, srv.URL, platTok, "POST", "/api/v1/tenants/not-a-uuid/sites",
+		map[string]string{"site_key": "k", "name": "n", "cidr": "10.3.0.0/24"})
+	if st != http.StatusInternalServerError {
+		t.Fatalf("DB 错(非法 tid)应 500,得 %d body=%s", st, body)
+	}
+	if strings.Contains(string(body), "invalid input syntax") || strings.Contains(string(body), "uuid") ||
+		strings.Contains(string(body), "SQLSTATE") || strings.Contains(string(body), "pgx") {
+		t.Fatalf("500 响应应脱敏(不含底层 DB/驱动细节),得 %q", string(body))
 	}
 }

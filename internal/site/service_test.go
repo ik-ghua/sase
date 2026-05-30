@@ -57,6 +57,36 @@ func TestCheckCanonicalCIDR(t *testing.T) {
 	}
 }
 
+// TestCreateSiteValidationWrapsErrInvalidSite 纯逻辑(不依赖 DB):CreateSite 的所有输入
+// 校验类错误(缺字段 / CIDR 解析失败 / 非规范族表示)都须满足 errors.Is(err, ErrInvalidSite)
+// (Slice73 错误码治理:handler 据此分流 400)。非规范 CIDR 还须仍满足 ErrNonCanonicalCIDR
+// (子哨兵不破坏,现有细分判定依赖)。校验在 store 访问之前发生,store 传 nil 不会被解引用。
+func TestCreateSiteValidationWrapsErrInvalidSite(t *testing.T) {
+	svc := NewService(nil)
+	ctx := context.Background()
+	cases := []struct {
+		name             string
+		st               *Site
+		alsoNonCanonical bool
+	}{
+		{"缺 site_key", &Site{Name: "x", CIDR: "10.0.0.0/24"}, false},
+		{"缺 cidr", &Site{SiteKey: "k", Name: "x"}, false},
+		{"CIDR 解析失败", &Site{SiteKey: "k", Name: "x", CIDR: "10.0.0.0/99"}, false},
+		{"v4-mapped 非规范", &Site{SiteKey: "k", Name: "x", CIDR: "::ffff:10.0.0.0/104"}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := svc.CreateSite(ctx, "t1", c.st)
+			if !errors.Is(err, ErrInvalidSite) {
+				t.Fatalf("校验错应包裹 ErrInvalidSite,得 %v", err)
+			}
+			if c.alsoNonCanonical && !errors.Is(err, ErrNonCanonicalCIDR) {
+				t.Fatalf("非规范 CIDR 应同时满足 ErrNonCanonicalCIDR,得 %v", err)
+			}
+		})
+	}
+}
+
 func TestServiceIntegration(t *testing.T) {
 	cfg, ok := data.ConfigFromEnv()
 	if !ok {

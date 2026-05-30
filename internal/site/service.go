@@ -37,14 +37,17 @@ func NewService(store data.Store) Service { return &service{store: store} }
 
 func (s *service) CreateSite(ctx context.Context, tenantID string, st *Site) error {
 	if st.SiteKey == "" || st.CIDR == "" {
-		return errors.New("site.CreateSite: site_key 与 cidr 必填")
+		return fmt.Errorf("site.CreateSite: site_key 与 cidr 必填: %w", ErrInvalidSite)
 	}
 	if _, ipnet, err := net.ParseCIDR(st.CIDR); err != nil {
-		return fmt.Errorf("site.CreateSite: cidr %q 非法: %w", st.CIDR, err)
+		// net.ParseCIDR 解析失败是输入校验类错误(归 ErrInvalidSite → handler 400);
+		// 包住底层 net 错误供排障,但 errors.Is(err, ErrInvalidSite) 成立。
+		return fmt.Errorf("site.CreateSite: cidr %q 非法: %w: %w", st.CIDR, err, ErrInvalidSite)
 	} else if err := checkCanonicalCIDR(ipnet); err != nil {
 		// 输入侧纵深(承接 Slice70):拒绝非规范族表示(如 v4-mapped-v6 ::ffff:10.0.0.0/104),
 		// 防其穿到数据面 dptunnel LPM 引发族不一致/越界(fail-closed,不入库)。
-		return fmt.Errorf("site.CreateSite: cidr %q %w", st.CIDR, err)
+		// 同归 ErrInvalidSite(校验类),但仍包 ErrNonCanonicalCIDR 供调用方细分(现有测试依赖)。
+		return fmt.Errorf("site.CreateSite: cidr %q %w: %w", st.CIDR, err, ErrInvalidSite)
 	}
 	if st.ID == "" {
 		st.ID = uuid.NewString()
@@ -63,8 +66,17 @@ func (s *service) CreateSite(ctx context.Context, tenantID string, st *Site) err
 	})
 }
 
+// ErrInvalidSite 是 CreateSite 输入校验类错误的统一哨兵(缺字段 / CIDR 解析失败 /
+// 非规范族表示等)。handler 经 errors.Is(err, ErrInvalidSite) 分流为 400 + 回显安全文案;
+// DB 错误**不**包裹本哨兵(保持原样 → handler 归 500 脱敏)。
+//
+// 设计:CreateSite 用 Go 1.20+ 多 %w 包裹,使校验错同时满足 errors.Is(ErrInvalidSite)
+// 与更具体的子哨兵(如 ErrNonCanonicalCIDR),既能统一分流又不破坏现有细分判定。
+var ErrInvalidSite = errors.New("site: 站点输入非法")
+
 // ErrNonCanonicalCIDR 表示 CIDR 用了非规范的地址族表示(典型:v4-mapped-v6,如
 // ::ffff:10.0.0.0/104)。要求 v4 地址用 v4 掩码、v6 地址用 v6 掩码,二者一一对应。
+// 它是 ErrInvalidSite 的子类(CreateSite 同时包裹两者)。
 var ErrNonCanonicalCIDR = errors.New("非规范:v4 地址须用 v4 掩码,勿用 v4-mapped-v6 表示")
 
 // checkCanonicalCIDR 校验 net.ParseCIDR 解析出的网络段是规范族表示:

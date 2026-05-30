@@ -40,6 +40,11 @@ type Service interface {
 	ListConnectors(ctx context.Context, tenantID string) ([]Connector, error)
 }
 
+// ErrInvalidResource 是 CreateApp/CreateConnector 输入校验类错误的统一哨兵(缺必填字段等)。
+// handler 经 errors.Is(err, ErrInvalidResource) 分流为 400 + 回显安全文案;
+// DB 错误**不**包裹本哨兵(保持原样 → handler 归 500 脱敏)。
+var ErrInvalidResource = errors.New("resource: 资源输入非法")
+
 type service struct {
 	store data.Store
 }
@@ -49,7 +54,7 @@ func NewService(store data.Store) Service { return &service{store: store} }
 
 func (s *service) CreateApp(ctx context.Context, tenantID string, a *App) error {
 	if a.AppKey == "" || a.Name == "" {
-		return errors.New("resource.CreateApp: app_key 与 name 必填")
+		return fmt.Errorf("resource.CreateApp: app_key 与 name 必填: %w", ErrInvalidResource)
 	}
 	if a.ID == "" {
 		a.ID = uuid.NewString()
@@ -116,7 +121,7 @@ func (s *service) AppKeys(ctx context.Context, tenantID string) (map[string]bool
 
 func (s *service) CreateConnector(ctx context.Context, tenantID string, c *Connector) error {
 	if c.AppKey == "" || c.Name == "" {
-		return errors.New("resource.CreateConnector: app_key 与 name 必填")
+		return fmt.Errorf("resource.CreateConnector: app_key 与 name 必填: %w", ErrInvalidResource)
 	}
 	if c.ID == "" {
 		c.ID = uuid.NewString()
