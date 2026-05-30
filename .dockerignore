@@ -1,0 +1,34 @@
+# Docker build context 排除(deploy/Dockerfile 以仓库根为 context)。
+# 目的:① 不把 1.3G .pnpm-store / 322M node_modules / dist / output 等送进 build context(慢且无用);
+#      ② 不把 dev 证书私钥送进镜像(镜像内由 devpki init 容器在共享 volume 现生成)。
+# 注:Go build 只需源码 + go.mod/go.sum;前端构建产物不参与 Go 二进制构建。
+
+# 前端依赖与产物(Go 镜像构建不需要;web 单独的 Dockerfile 自带 context 处理)
+web/admin/node_modules/
+web/admin/dist/
+web/admin/test-results/
+.pnpm-store/
+
+# 构建产物 / 缓存
+output/
+.cache/
+.corepack/
+*.test
+*.out
+*.tgz
+
+# dev 自签证书(含私钥,绝不进镜像;运行期由 devpki 容器生成到共享 volume)
+certs/
+
+# 外部/参考资料(clean-room,非本仓代码,体量大)
+tools/
+.tmp-open-design/
+
+# VCS / IDE / OS
+.git/
+.githooks/
+.claude/
+.DS_Store
+
+# deploy 自身不需进 build context(Dockerfile 不 COPY deploy/)
+deploy/

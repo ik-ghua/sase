@@ -1,0 +1,182 @@
+# SASE 最小可演示栈(MVP 阶段1:从"测试里能跑"到"真实环境能演示")。
+#
+# 起的服务:
+#   postgres   —— PG16(>=15 必需,migration 0020 NULLS NOT DISTINCT);建库 sase。
+#   devpki     —— init 容器:生成 dev mTLS 证书(ca/server/client/pop/device)到共享 volume `certs`。
+#   migrate    —— init 容器:按序应用 migrations/0001..0024(以 superuser,含建 app_rw/app_ro/app_platform_*
+#                 角色 + 0013 视图 owner 绕 RLS)+ seed demo 租户/用户。
+#   api-server —— 控制面/管理面:管理 HTTPS :8443(/healthz、/api/v1/*、/trust/pubkey)、
+#                 控制+遥测 gRPC :8082、设备 ZTP 续期 mTLS :8444、/metrics :9100 + :9101。
+#                 SASE_BOOTSTRAP_PLATFORM_ADMIN 启动签发 platform_admin 令牌打印到日志。
+#   xds-server —— 控制面单元②:配置分发 ADS/Delta over mTLS gRPC :9090、/metrics :9102。
+#   pop-agent  —— PoP 数据面边缘:订阅 xds-server 拿策略/撤销/SWG/FW/DLP/站点;接入面 :8081、
+#                 连接器口 :7000;经 TRUST_URL 取 api-server 的签发公钥;TELEMETRY_ADDR 上报 DLP 命中。
+#
+# 端口/env 均从 cmd/*/main.go 实读(见 deploy/README.md 的对账表)。
+# 角色/密码与本机测试基建一致(app_rw_dev 等),可经 deploy/.env 覆盖。
+#
+# ⚠️ 全部 dev 用途:自签 mTLS、DevProvider KEK、bootstrap 令牌进日志。生产严禁。
+
+name: sase-demo
+
+services:
+  # ---- Postgres(数据库) ----
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${PG_SUPERUSER:-postgres}
+      POSTGRES_PASSWORD: ${PG_SUPERPASS:-postgres}
+      POSTGRES_DB: ${PG_DB:-sase}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_SUPERUSER:-postgres} -d ${PG_DB:-sase}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    # 不对宿主暴露 5432(避免与本机 sase-pg-local:5433 / 其它 PG 冲突);需调试可临时加 ports。
+
+  # ---- devpki:生成 dev mTLS 证书到共享 volume(init 容器,跑完即退) ----
+  devpki:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        CMD: devpki
+    environment:
+      OUT: /certs
+    volumes:
+      - certs:/certs
+    # init 容器需写新建的 certs volume(root 拥有);长期服务(api/xds/pop)只读挂载、仍非 root。
+    user: "0:0"
+    # devpki 进程跑完写完证书即退出(exit 0)。
+    restart: "no"
+
+  # ---- migrate:按序应用迁移 + seed(init 容器,跑完即退) ----
+  migrate:
+    image: postgres:16-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${PG_SUPERUSER:-postgres}
+      PGPASSWORD: ${PG_SUPERPASS:-postgres}
+      PGDATABASE: ${PG_DB:-sase}
+      MIGRATIONS_DIR: /migrations
+      SEED_FILE: /seed/seed.sql
+    volumes:
+      - ../migrations:/migrations:ro
+      - ../scripts/migrate.sh:/migrate.sh:ro
+      - ../scripts/seed.sql:/seed/seed.sql:ro
+    entrypoint: ["/bin/sh", "/migrate.sh"]
+    restart: "no"
+
+  # ---- api-server:控制面/管理面 ----
+  api-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        CMD: api-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      devpki:
+        condition: service_completed_successfully
+    environment:
+      # 四 DSN(角色密码与迁移内 CREATE ROLE 一致;经 .env 可覆盖)
+      SASE_DB_RW_DSN: postgres://app_rw:${APP_RW_PASS:-app_rw_dev}@postgres:5432/${PG_DB:-sase}?sslmode=disable
+      SASE_DB_RO_DSN: postgres://app_ro:${APP_RO_PASS:-app_ro_dev}@postgres:5432/${PG_DB:-sase}?sslmode=disable
+      SASE_DB_PLATFORM_DSN: postgres://app_platform_ro:${APP_PLATFORM_RO_PASS:-app_platform_ro_dev}@postgres:5432/${PG_DB:-sase}?sslmode=disable
+      SASE_DB_PLATFORM_RW_DSN: postgres://app_platform_rw:${APP_PLATFORM_RW_PASS:-app_platform_rw_dev}@postgres:5432/${PG_DB:-sase}?sslmode=disable
+      SASE_TLS_DIR: /certs
+      # 引导首枚 platform_admin:启动签发短期(15min)令牌打印日志(docker compose logs api-server 取用)
+      SASE_BOOTSTRAP_PLATFORM_ADMIN: ${BOOTSTRAP_PLATFORM_ADMIN:-ops@demo.local}
+      # 凭证签发种子(固定 → 重启稳定,pop-agent 取的 TrustBundle 公钥不变;base64url RawURLEncoding 解码须恰 32B)
+      SASE_CRED_ED25519_SEED: ${CRED_ED25519_SEED:-c2FzZS1kZW1vLWVkMjU1MTktc2VlZC0zMmJ5dGVBQiE}
+      # secret 模块 dev KEK(base64 StdEncoding 解码须恰 32B;固定 → 重启后 idp_config 等密文仍可解)
+      SASE_DEV_KEK: ${DEV_KEK:-c2FzZS1kZW1vLWRldi1rZWstMzJieXRlcy1BQkNERSE=}
+      # CSRF 允许的浏览器源(前端 dev/容器同源访问;逗号分隔)
+      SASE_CSRF_ALLOWED_ORIGINS: ${CSRF_ALLOWED_ORIGINS:-http://localhost:5173,https://localhost:8443}
+      # 监听地址(默认值即可,显式写出便于对照)
+      ADMIN_ADDR: ":8443"
+      AGENTCTL_ADDR: ":8082"
+      DEVICE_ADDR: ":8444"
+      SASE_API_METRICS_ADDR: ":9100"
+      SASE_DEVICE_METRICS_ADDR: ":9101"
+    ports:
+      - "${ADMIN_PORT:-8443}:8443"   # 管理 HTTPS(控制台/curl)
+      - "${DEVICE_PORT:-8444}:8444"  # 设备 ZTP 续期 mTLS
+      - "${AGENTCTL_PORT:-8082}:8082" # 控制 + 遥测 gRPC
+    volumes:
+      - certs:/certs:ro
+    healthcheck:
+      # /healthz 是 HTTPS(整个 admin mux 在 TLS 后);自签证书 → --no-check-certificate
+      test: ["CMD-SHELL", "wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8443/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # ---- xds-server:配置分发(ADS/Delta over mTLS) ----
+  xds-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        CMD: xds-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      devpki:
+        condition: service_completed_successfully
+    environment:
+      SASE_DB_RW_DSN: postgres://app_rw:${APP_RW_PASS:-app_rw_dev}@postgres:5432/${PG_DB:-sase}?sslmode=disable
+      SASE_DB_RO_DSN: postgres://app_ro:${APP_RO_PASS:-app_ro_dev}@postgres:5432/${PG_DB:-sase}?sslmode=disable
+      SASE_TLS_DIR: /certs
+      XDS_ADDR: ":9090"
+      METRICS_ADDR: ":9102"
+      # dev 默认宽松;生产置 1(role-less/无证书订阅被拒)
+      SASE_XDS_REQUIRE_CERT_SCOPE: ${XDS_REQUIRE_CERT_SCOPE:-0}
+    volumes:
+      - certs:/certs:ro
+
+  # ---- pop-agent:PoP 数据面边缘 ----
+  pop-agent:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        CMD: pop-agent
+    depends_on:
+      api-server:
+        condition: service_healthy
+      xds-server:
+        condition: service_started
+    environment:
+      XDS_ADDR: xds-server:9090
+      TRUST_URL: https://api-server:8443
+      TELEMETRY_ADDR: api-server:8082
+      SASE_TLS_DIR: /certs
+      # 必填:demo 租户 UUID(与 scripts/seed.sql 固定 UUID 一致 → pop-agent 订阅该租户)
+      TENANT: ${DEMO_TENANT_ID:-11111111-1111-1111-1111-111111111111}
+      NODE: ${POP_NODE:-pop-demo}
+      INGRESS_ADDR: ":8081"
+      CONNECTOR_ADDR: ":7000"
+      METRICS_ADDR: ":9101"
+      # dev 默认关(容忍共享证书);生产置 1(W9 fail-closed:仅 ZTP 租户绑定证书)
+      SASE_REQUIRE_CERT_TENANT: ${REQUIRE_CERT_TENANT:-0}
+    ports:
+      - "${INGRESS_PORT:-8081}:8081" # ZTNA 接入面(mTLS),供 agent 演示
+    volumes:
+      - certs:/certs:ro
+
+volumes:
+  pgdata:
+  certs:
