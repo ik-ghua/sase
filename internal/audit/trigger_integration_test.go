@@ -122,7 +122,9 @@ func TestAuditTriggerCatalogGate(t *testing.T) {
 	defer store.Close()
 
 	// 含 tenant_id 列但缺 audit_tr 触发器、且不在排除清单中的业务表 → 违规。
-	// 排除:revocations(GC 风暴)、policy_bundles(编译高频)、audit_log(自触发)。
+	// 排除:revocations(GC 风暴)、policy_bundles(编译高频)、audit_log(自触发)、
+	//      risk_scores(Slice68 风险快照 best-effort upsert,每次风险观测旁路写,高频——
+	//      与 revocations/policy_bundles 同理排除防审计风暴;权威风险事件流走 ClickHouse 遥测,非 audit_log)。
 	const q = `
 		SELECT c.relname
 		FROM pg_class c
@@ -130,7 +132,7 @@ func TestAuditTriggerCatalogGate(t *testing.T) {
 		JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'tenant_id'
 		                   AND a.attnum > 0 AND NOT a.attisdropped
 		WHERE c.relkind = 'r'
-		  AND c.relname NOT IN ('revocations', 'policy_bundles', 'audit_log')
+		  AND c.relname NOT IN ('revocations', 'policy_bundles', 'audit_log', 'risk_scores')
 		  AND NOT EXISTS (
 		    SELECT 1 FROM pg_trigger tg
 		    WHERE tg.tgrelid = c.oid AND tg.tgname = 'audit_tr' AND NOT tg.tgisinternal
