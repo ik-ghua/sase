@@ -64,6 +64,31 @@ func (g *Guard) WithAdminActiveChecker(c AdminActiveChecker) *Guard {
 	return g
 }
 
+// VerifyAdminToken 校验一枚 admin 令牌串(验签 + 有效期 + 角色为合法 admin 角色),返回 Principal。
+// 供会话登录端点(POST /api/v1/login)复用——与 Middleware authenticate **完全相同**的校验,不放宽。
+// 注:**不**做 platform_admin 主动撤销(AdminActiveChecker)复查;那是 per-request 中间件职责,
+// 登录时签出的 cookie 在后续每个请求仍会经中间件复查 active(故撤销对 cookie 同样即时生效)。
+func (g *Guard) VerifyAdminToken(token string) (Principal, error) {
+	claims, err := g.verifier.Verify(token, g.now())
+	if err != nil {
+		return Principal{}, err
+	}
+	if !adminRoles[claims.Role] {
+		return Principal{}, errors.New("非管理面令牌(无 admin 角色)")
+	}
+	return Principal{Subject: claims.Subject, Role: claims.Role, TenantID: claims.TenantID}, nil
+}
+
+// TokenExpiry 返回令牌的过期时间(供登录端点设 cookie Max-Age 与回响非敏感会话信息;不含 token 本身)。
+// 仅在 token 已验签通过后调用有意义;此处只解出 exp,不重复验签。
+func (g *Guard) TokenExpiry(token string) (time.Time, error) {
+	claims, err := g.verifier.Verify(token, g.now())
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(claims.ExpireAt, 0), nil
+}
+
 var adminRoles = map[string]bool{RolePlatformAdmin: true, RoleTenantAdmin: true, RoleAuditor: true}
 
 // ValidAdminRole 判定是否合法管理面角色。
@@ -95,6 +120,13 @@ func (g *Guard) Middleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// 公开:会话登录/登出(W2)。login 用请求体里的令牌自证身份(首次无 cookie/Bearer),
+		// 故必须免中间件鉴权;handler 内部用 VerifyAdminToken 严格验签,不持有效令牌则 401。
+		// logout 只清 cookie(无副作用、幂等),也放行。
+		if r.Method == http.MethodPost && (r.URL.Path == "/api/v1/login" || r.URL.Path == "/api/v1/logout") {
+			next.ServeHTTP(w, r)
+			return
+		}
 		p, err := g.authenticate(r)
 		if err != nil {
 			http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
@@ -121,14 +153,22 @@ func (g *Guard) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-// authenticate 校验 Bearer admin 令牌 → Principal。ZTNA 会话令牌(Role 空)在此被拒。
+// SessionCookieName 是会话令牌 cookie 名(W2:cookie→authz 桥接)。
+// 由 POST /api/v1/login 与 OIDC callback(Slice37c)种;HttpOnly,JS 不可读(消除 localStorage Bearer 的 XSS 面)。
+const SessionCookieName = "sase_session"
+
+// authenticate 校验 admin 令牌 → Principal。令牌来源二选一:
+//  1. Authorization: Bearer <token>(优先);
+//  2. 无 Bearer header 时回退 `sase_session` cookie(W2 桥接,平台控制台用 HttpOnly 会话 cookie)。
+//
+// **两种来源用完全相同的验签/角色校验**(不放宽任何检查):令牌经 cred.Verifier 验签 + 有效期,
+// 且 claims.Role 须为合法 admin 角色。ZTNA 会话令牌(Role 空)在此被拒。
 func (g *Guard) authenticate(r *http.Request) (Principal, error) {
-	const pfx = "Bearer "
-	h := r.Header.Get("Authorization")
-	if !strings.HasPrefix(h, pfx) {
-		return Principal{}, errors.New("缺 Bearer 令牌")
+	tok, err := extractToken(r)
+	if err != nil {
+		return Principal{}, err
 	}
-	claims, err := g.verifier.Verify(strings.TrimPrefix(h, pfx), g.now())
+	claims, err := g.verifier.Verify(tok, g.now())
 	if err != nil {
 		return Principal{}, err
 	}
@@ -136,6 +176,19 @@ func (g *Guard) authenticate(r *http.Request) (Principal, error) {
 		return Principal{}, errors.New("非管理面令牌(无 admin 角色)")
 	}
 	return Principal{Subject: claims.Subject, Role: claims.Role, TenantID: claims.TenantID}, nil
+}
+
+// extractToken 取令牌串:Bearer header 优先,否则回退 sase_session cookie;两者皆无 → 错误。
+// 仅取原始串,验签/角色/active 校验由 authenticate 与 Middleware 统一处理(cookie 与 Bearer 同路径)。
+func extractToken(r *http.Request) (string, error) {
+	const pfx = "Bearer "
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, pfx) {
+		return strings.TrimPrefix(h, pfx), nil
+	}
+	if c, err := r.Cookie(SessionCookieName); err == nil && c.Value != "" {
+		return c.Value, nil
+	}
+	return "", errors.New("缺 Bearer 令牌或会话 cookie")
 }
 
 // authorize 按 方法 + 路径 判定(纯函数,易审计/测)。

@@ -115,6 +115,9 @@ var AdminRoutePatterns = []string{
 	// IdP OIDC 登录入口/回调(Slice37a;authz 已放行,未认证用户经 IdP 换发 SASE 会话凭证)
 	"GET /api/v1/idp/login",
 	"GET /api/v1/idp/callback",
+	// 会话登录/登出(W2):用令牌换 HttpOnly sase_session cookie / 清 cookie。authz 已放行(login 自证身份)。
+	"POST /api/v1/login",
+	"POST /api/v1/logout",
 }
 
 // Register 装配 Admin API 路由。
@@ -195,6 +198,9 @@ func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity
 		// IdP OIDC 登录/回调:authz 已放行未认证;oidcDeps nil 时返 503(便兼容无 OIDC 部署 + 测试 nil 注入)
 		"GET /api/v1/idp/login":    oidcLogin(oidcDeps),
 		"GET /api/v1/idp/callback": oidcCallback(oidcDeps),
+		// 会话登录/登出(W2):login 验令牌(同 authz 校验)→ 种 HttpOnly sase_session cookie;logout 清 cookie。
+		"POST /api/v1/login":  sessionLogin(authz.NewGuard(verifier)),
+		"POST /api/v1/logout": sessionLogout(),
 	}
 	assertRouteCoverage(handlers) // fail-loud:handler 集合须与 AdminRoutePatterns 逐条一致(防清单↔实现漂移)
 
@@ -213,6 +219,13 @@ func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity
 			"/api/v1/idp/login":    true, // GET 跳 IdP;白名单避免冗余颁发(GET 本身不校验)
 			"/api/v1/idp/callback": true, // GET IdP→服务端跳转
 			"/api/v1/trust/pubkey": true, // 公开只读
+			// 会话登录(W2):首次登录浏览器尚无 csrf_token cookie(double-submit 无从满足),
+			// 故白名单(同 /idp/callback)。防护退化为:① 请求体须含合法签名令牌(攻击者无从伪造);
+			// ② 即便 CSRF 强制浏览器发起 login,得到的也只是把**攻击者自己的**令牌种进受害者浏览器
+			//    (login-CSRF,非提权——受害者会以攻击者身份登录,无横向危害,且无凭证可窃)。
+			"/api/v1/login": true,
+			// 登出无副作用(只清 cookie,幂等),白名单避免登出受 CSRF token 缺失阻塞。
+			"/api/v1/logout": true,
 		},
 	})
 	chain := csrfMW(authz.NewGuard(verifier).WithAdminActiveChecker(adminActiveChecker).Middleware(audit.ActorMiddleware(audit.Middleware(auditSvc)(api))))
@@ -1204,6 +1217,81 @@ func oidcCallback(deps *oidc.HandlerDeps) http.HandlerFunc {
 		}
 	}
 	return oidc.CallbackHandler(deps)
+}
+
+// sessionLogin(W2)用一枚有效 admin 令牌换取 HttpOnly `sase_session` cookie:
+// 把"平台控制台登录态"从前端 localStorage Bearer(自承 XSS 风险)迁到 HttpOnly cookie(JS 不可读)。
+//
+// 令牌来源:请求体 `{"token": "..."}`(MVP:既有 IssueAdminToken 签出的令牌 / bootstrap 令牌;
+// IdP-平台-SSO 到位后由同一会话签发点接入,见报告诚实边界)。
+//
+// **校验严格性**:经 guard.VerifyAdminToken —— 与 authz 中间件 authenticate **完全相同**的验签 + 有效期 +
+// 合法 admin 角色校验,不放宽。非法/过期/非 admin 角色令牌 → 401。
+//
+// **token 绝不回响应体**:只进 HttpOnly cookie;响应体仅含非敏感会话信息(role/tenant_id/exp),便前端展示。
+func sessionLogin(guard *authz.Guard) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Token string `json:"token"`
+		}
+		if !decode(w, r, &body) {
+			return
+		}
+		if body.Token == "" {
+			http.Error(w, "token required", http.StatusBadRequest)
+			return
+		}
+		p, err := guard.VerifyAdminToken(body.Token)
+		if err != nil {
+			// 不泄漏内部验签错误细节(脱敏):统一 401(签名错/过期/非 admin 角色)。
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		exp, err := guard.TokenExpiry(body.Token)
+		if err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		// cookie Max-Age 与令牌剩余有效期对齐(钳到 ≥1s;过期令牌已被上面 Verify 拒)。
+		maxAge := int(time.Until(exp).Seconds())
+		if maxAge < 1 {
+			maxAge = 1
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     authz.SessionCookieName,
+			Value:    body.Token,
+			Path:     "/",
+			MaxAge:   maxAge,
+			HttpOnly: true, // 防 JS 读(XSS 即便注入也拿不到 token,消除 localStorage Bearer 面)
+			Secure:   r.TLS != nil || strings.HasPrefix(strings.ToLower(r.Header.Get("X-Forwarded-Proto")), "https"),
+			SameSite: http.SameSiteLaxMode, // 同 OIDC callback:跨站顶层导航回本站仍带 cookie
+		})
+		// 响应体只回非敏感会话信息(**不含 token**;token 只在 HttpOnly cookie)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"subject":    p.Subject,
+			"role":       p.Role,
+			"tenant_id":  p.TenantID,
+			"expires_at": exp,
+		})
+	}
+}
+
+// sessionLogout(W2)清除 `sase_session` cookie(Max-Age<0 立即失效)。幂等(无 cookie 也 200)。
+// 注:令牌仍在其 TTL 内有效(无服务端会话存储,stateless);要立即吊销 platform_admin 令牌走
+// platform_admins disable/delete(Slice55/56 主动撤销,per-request 复查)。
+func sessionLogout() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{
+			Name:     authz.SessionCookieName,
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1, // 立即删除
+			HttpOnly: true,
+			Secure:   r.TLS != nil || strings.HasPrefix(strings.ToLower(r.Header.Get("X-Forwarded-Proto")), "https"),
+			SameSite: http.SameSiteLaxMode,
+		})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "logged_out"})
+	}
 }
 
 // PoP 注册 handlers(Slice38a + Slice39 双层审计接入)。

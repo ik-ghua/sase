@@ -2601,6 +2601,112 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 会话登录(W2;公开;用 admin 令牌换 HttpOnly sase_session cookie)
+         * @description 把"平台控制台登录态"从前端 localStorage Bearer(XSS 风险)迁到 HttpOnly cookie(JS 不可读)。
+         *     请求体提交一枚有效 admin 令牌(MVP:既有 admin-tokens 签出的令牌 / bootstrap 令牌);
+         *     后端用与 authz 中间件**完全相同**的验签 + 有效期 + 合法 admin 角色校验,通过则
+         *     Set-Cookie `sase_session`(HttpOnly + SameSite=Lax + Secure[经 r.TLS] + Path=/ + Max-Age=令牌剩余 TTL)。
+         *     **响应体不含 token**(token 只在 HttpOnly cookie);只回非敏感会话信息(role/tenant_id/exp)便前端展示。
+         *     CSRF 白名单(首次登录无 csrf_token cookie 无从满足 double-submit;防护退化为"须持合法签名令牌")。
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["LoginRequest"];
+                };
+            };
+            responses: {
+                /** @description 登录成功(已种 sase_session cookie) */
+                200: {
+                    headers: {
+                        "Set-Cookie"?: string;
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["SessionInfo"];
+                    };
+                };
+                /** @description 缺 token / bad json */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description 令牌无效/过期/非 admin 角色 */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 会话登出(W2;公开;清 sase_session cookie,幂等)
+         * @description 清除 sase_session cookie(Max-Age<0 立即失效)。幂等(无 cookie 也 200)。
+         *     注:令牌本身在其 TTL 内仍有效(stateless,无服务端会话存储);要即时吊销 platform_admin
+         *     令牌走 platform_admins disable/delete(Slice55/56 主动撤销,中间件 per-request 复查)。
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description 已登出(已清 sase_session cookie) */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            status?: string;
+                        };
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -3066,6 +3172,28 @@ export interface components {
             user_id: string;
             /** @description 邮箱(IdP 返回 */
             email?: string;
+        };
+        /** @description 会话登录请求(W2):提交一枚有效 admin 令牌换 HttpOnly sase_session cookie。 */
+        LoginRequest: {
+            /** @description 有效 admin 令牌(MVP:admin-tokens 签出的 / bootstrap 令牌) */
+            token: string;
+        };
+        /** @description 登录成功返回的非敏感会话信息(**不含 token**;token 只在 HttpOnly cookie)。 */
+        SessionInfo: {
+            /** @description 令牌主体 */
+            subject: string;
+            /**
+             * @description 角色
+             * @enum {string}
+             */
+            role: "platform_admin" | "tenant_admin" | "auditor";
+            /** @description 租户作用域(platform_admin 为空) */
+            tenant_id?: string;
+            /**
+             * Format: date-time
+             * @description 会话(令牌)过期时间
+             */
+            expires_at?: string;
         };
     };
     responses: {

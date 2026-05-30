@@ -1,9 +1,12 @@
-// Slice 41/42/44:openapi-fetch 客户端 + CSRF + dev Bearer + 401 集中登出 middleware。
-// baseUrl 走 Vite proxy `/api`(转后端 :8443);credentials:'include' 让浏览器自动带 sase_session cookie。
+// Slice 41/42/44 + W2:openapi-fetch 客户端 + CSRF + HttpOnly 会话 cookie + 401 集中登出 middleware。
+// baseUrl 走 Vite proxy `/api`(转后端 :8443);credentials:'include' 让浏览器自动带 HttpOnly sase_session cookie。
+//
+// W2 变更:**去掉 localStorage Bearer 注入**(消除 XSS 面)。登录态统一走 HttpOnly `sase_session` cookie
+// (POST /api/v1/login 种、authz 中间件读;cookie 与 Bearer 在后端二选一,前端浏览器只用 cookie)。
+// CSRF double-submit 仍生效(写方法把非 HttpOnly 的 csrf_token cookie 复制到 X-CSRF-Token header)。
 import createClient, { type Middleware } from 'openapi-fetch';
 import type { paths } from './types';
 import { getCsrfTokenFromCookie } from '@/lib/csrf';
-import { getDevToken } from '@/stores/auth';
 
 const CSRF_HEADER = 'X-CSRF-Token';
 const WRITE_METHODS = new Set(['POST', 'PATCH', 'PUT', 'DELETE']);
@@ -21,18 +24,6 @@ const csrfMiddleware: Middleware = {
   },
 };
 
-// Slice 42 Authorization middleware:dev 模式注入 Bearer admin token(从 Zustand store 同步读)。
-// 生产模式 dev token 为空 → 不注入,浏览器自动带 sase_session cookie(credentials:'include')。
-const authMiddleware: Middleware = {
-  onRequest({ request }) {
-    const devToken = getDevToken();
-    if (devToken) {
-      request.headers.set('Authorization', `Bearer ${devToken}`);
-    }
-    return request;
-  },
-};
-
 // Slice 44 401 集中登出:任何请求返 401 → 触发全局未认证处理(清 dev token + 跳 /login)。
 // 用回调注入(避免 client.ts → auth store → client.ts 循环 import 风险;由 main.tsx 注册)。
 let onUnauthorized: (() => void) | null = null;
@@ -40,11 +31,17 @@ export function setUnauthorizedHandler(fn: () => void): void {
   onUnauthorized = fn;
 }
 
+// 自处理 401 的端点(不触发全局登出回调):
+//   - /api/v1/login:登录失败的 401 由 auth store login() 自行置 detail(且无 cookie 可清,触发 logout 多余);
+//   - /api/v1/logout:登出本身,409/401 也无意义触发再次登出。
+const SELF_HANDLED_401 = ['/api/v1/login', '/api/v1/logout'];
+
 const authExpiryMiddleware: Middleware = {
-  onResponse({ response }) {
-    // 探活端点(auth-probe)自己处理 401,不触发全局跳转——靠 url 豁免 platform/tenants 探活?
-    // 简化:401 一律触发全局登出;探活在未登录态本就期望跳 /login,语义一致。
-    if (response.status === 401 && onUnauthorized) {
+  onResponse({ request, response }) {
+    // 401 集中登出:任何受保护请求返 401(会话过期/cookie 失效)→ 触发全局未认证处理 → AuthGuard 跳 /login。
+    // 登录/登出端点自处理,豁免(否则失败登录会触发一次多余的 logout POST + 覆盖 detail)。
+    const selfHandled = SELF_HANDLED_401.some((p) => request.url.includes(p));
+    if (response.status === 401 && onUnauthorized && !selfHandled) {
       onUnauthorized();
     }
     return response;
@@ -59,6 +56,5 @@ export const client = createClient<paths>({
   credentials: 'include',
 });
 
-client.use(authMiddleware);
 client.use(csrfMiddleware);
 client.use(authExpiryMiddleware);

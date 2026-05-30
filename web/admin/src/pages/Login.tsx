@@ -1,7 +1,8 @@
-// Slice 42:登录页(dev token 模式 + OIDC 跳转模式)。
+// Slice 42 + W2:登录页(令牌登录模式 + OIDC 跳转模式)。
 //
-// dev 模式:粘 SASE_BOOTSTRAP_PLATFORM_ADMIN 启动期签发的 admin token → setDevToken → 探活 → 跳 /
-// OIDC 模式:手输 tenant_id + idp_id → 跳 `/api/v1/idp/login?...&return_to=/`(浏览器经 Vite proxy 转后端 :8443)
+// 令牌登录(W2):粘 admin 令牌(bootstrap / admin-tokens 签出)→ login() → POST /api/v1/login
+//   → 后端验签后 Set-Cookie HttpOnly sase_session → 探活 → 跳 /。**令牌不落 localStorage**(只进 HttpOnly cookie,消除 XSS 面)。
+// OIDC 模式:手输 tenant_id + idp_id → 跳 `/api/v1/idp/login?...&return_to=/`(浏览器经 Vite proxy 转后端 :8443)。
 //
 // 注:dev 期无真 IdP sandbox,OIDC 端到端不能跑通(后端 OIDC discovery 会报错);**仅 UI 通**。
 import { useEffect, useState } from 'react';
@@ -22,8 +23,7 @@ export default function Login() {
   const location = useLocation();
   const status = useAuthStore((s) => s.status);
   const detail = useAuthStore((s) => s.detail);
-  const setDevToken = useAuthStore((s) => s.setDevToken);
-  const probe = useAuthStore((s) => s.probe);
+  const login = useAuthStore((s) => s.login);
 
   const [token, setToken] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -37,11 +37,11 @@ export default function Login() {
     }
   }, [status, navigate, from]);
 
-  const handleDevLogin = async () => {
+  // 令牌登录(W2):POST /api/v1/login 种 HttpOnly cookie → 探活。令牌不落 localStorage。
+  const handleTokenLogin = async () => {
     if (!token.trim()) return;
     setSubmitting(true);
-    setDevToken(token.trim());
-    await probe();
+    await login(token.trim());
     setSubmitting(false);
   };
 
@@ -73,20 +73,32 @@ export default function Login() {
           />
         )}
 
+        {status === 'unauthenticated' && detail && detail !== '主动登出' && (
+          <Alert
+            type="error"
+            message="登录失败"
+            description={detail}
+            style={{ marginBottom: 16 }}
+            showIcon
+          />
+        )}
+
         <Tabs
-          defaultActiveKey="dev"
+          defaultActiveKey="token"
           items={[
             {
-              key: 'dev',
+              key: 'token',
               label: (
                 <span>
-                  <KeyOutlined /> dev token
+                  <KeyOutlined /> 令牌登录
                 </span>
               ),
               children: (
                 <Space direction="vertical" style={{ width: '100%' }}>
                   <Paragraph>
-                    后端启动期设 <Text code>SASE_BOOTSTRAP_PLATFORM_ADMIN=&lt;subject&gt;</Text> 会打印一枚 15min platform_admin token,粘到下方:
+                    后端启动期设 <Text code>SASE_BOOTSTRAP_PLATFORM_ADMIN=&lt;subject&gt;</Text> 会打印一枚 platform_admin
+                    令牌(或经 admin-tokens 签发),粘到下方登录。令牌只换取 <Text code>HttpOnly</Text> 会话 cookie,
+                    <Text strong>不存浏览器本地</Text>。
                   </Paragraph>
                   <TextArea
                     rows={4}
@@ -98,12 +110,12 @@ export default function Login() {
                   <Button
                     type="primary"
                     icon={<LoginOutlined />}
-                    onClick={handleDevLogin}
+                    onClick={handleTokenLogin}
                     loading={submitting}
                     disabled={!token.trim()}
                     block
                   >
-                    使用 dev token 登录
+                    登录
                   </Button>
                 </Space>
               ),

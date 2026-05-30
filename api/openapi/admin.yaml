@@ -657,12 +657,48 @@ paths:
         '502': { description: OIDC discovery 失败 }
         '503': { description: OIDC 未配置 }
 
+  /api/v1/login:
+    post:
+      tags: [session]
+      summary: 会话登录(W2;公开;用 admin 令牌换 HttpOnly sase_session cookie)
+      description: |
+        把"平台控制台登录态"从前端 localStorage Bearer(XSS 风险)迁到 HttpOnly cookie(JS 不可读)。
+        请求体提交一枚有效 admin 令牌(MVP:既有 admin-tokens 签出的令牌 / bootstrap 令牌);
+        后端用与 authz 中间件**完全相同**的验签 + 有效期 + 合法 admin 角色校验,通过则
+        Set-Cookie `sase_session`(HttpOnly + SameSite=Lax + Secure[经 r.TLS] + Path=/ + Max-Age=令牌剩余 TTL)。
+        **响应体不含 token**(token 只在 HttpOnly cookie);只回非敏感会话信息(role/tenant_id/exp)便前端展示。
+        CSRF 白名单(首次登录无 csrf_token cookie 无从满足 double-submit;防护退化为"须持合法签名令牌")。
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/LoginRequest' } } } }
+      responses:
+        '200':
+          description: 登录成功(已种 sase_session cookie)
+          headers:
+            Set-Cookie: { schema: { type: string, example: 'sase_session=<token>; Path=/; Max-Age=900; HttpOnly; SameSite=Lax' } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/SessionInfo' } } }
+        '400': { description: 缺 token / bad json }
+        '401': { description: 令牌无效/过期/非 admin 角色 }
+
+  /api/v1/logout:
+    post:
+      tags: [session]
+      summary: 会话登出(W2;公开;清 sase_session cookie,幂等)
+      description: |
+        清除 sase_session cookie(Max-Age<0 立即失效)。幂等(无 cookie 也 200)。
+        注:令牌本身在其 TTL 内仍有效(stateless,无服务端会话存储);要即时吊销 platform_admin
+        令牌走 platform_admins disable/delete(Slice55/56 主动撤销,中间件 per-request 复查)。
+      security: []
+      responses:
+        '200':
+          description: 已登出(已清 sase_session cookie)
+          content: { application/json: { schema: { type: object, properties: { status: { type: string } } } } }
+
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
-      description: Bearer admin 令牌(cred 签名带 Role;授权后端强制,前端鉴权不可信)
+      description: Bearer admin 令牌(cred 签名带 Role;授权后端强制,前端鉴权不可信)。W2 起 authz 中间件亦认 HttpOnly sase_session cookie(Bearer 优先,二者用完全相同的校验)。
 
   parameters:
     Tid:
@@ -1048,3 +1084,20 @@ components:
         expires_in: { type: integer, format: int32, description: TTL 秒 }
         user_id: { type: string, format: uuid, description: SASE 用户 ID(IdP subject 经 EnsureUserByExternalID 映射) }
         email: { type: string, description: 邮箱(IdP 返回,可空) }
+
+    LoginRequest:
+      type: object
+      required: [token]
+      description: 会话登录请求(W2):提交一枚有效 admin 令牌换 HttpOnly sase_session cookie。
+      properties:
+        token: { type: string, description: 有效 admin 令牌(MVP:admin-tokens 签出的 / bootstrap 令牌) }
+
+    SessionInfo:
+      type: object
+      required: [subject, role]
+      description: 登录成功返回的非敏感会话信息(**不含 token**;token 只在 HttpOnly cookie)。
+      properties:
+        subject: { type: string, description: 令牌主体 }
+        role: { type: string, enum: [platform_admin, tenant_admin, auditor], description: 角色 }
+        tenant_id: { type: string, description: 租户作用域(platform_admin 为空) }
+        expires_at: { type: string, format: date-time, description: 会话(令牌)过期时间 }

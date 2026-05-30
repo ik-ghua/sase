@@ -32,14 +32,13 @@ function renderWith(ui: React.ReactElement, initialEntries: string[] = ['/']) {
 
 describe('Slice 41/42 smoke', () => {
   beforeEach(() => {
-    // 重置 zustand auth state(每个测试独立);probe 用 mock 跳过真 fetch
+    // 重置 zustand auth state(每个测试独立);probe/login 用 mock 跳过真 fetch
     useAuthStore.setState({
       status: 'unauthenticated',
       role: undefined,
-      devToken: '',
       detail: undefined,
       probe: vi.fn().mockResolvedValue(undefined),
-      setDevToken: useAuthStore.getState().setDevToken,
+      login: vi.fn().mockResolvedValue(undefined),
       logout: useAuthStore.getState().logout,
     });
   });
@@ -55,10 +54,10 @@ describe('Slice 41/42 smoke', () => {
     expect(screen.getByText('SASE 平台运维控制台')).toBeInTheDocument();
   });
 
-  it('Login 页渲染 dev token + OIDC 两个 Tab', () => {
+  it('Login 页渲染 令牌登录 + OIDC 两个 Tab', () => {
     renderWith(<Login />, ['/login']);
     expect(screen.getByText('登录 SASE 平台运维控制台')).toBeInTheDocument();
-    expect(screen.getByText('dev token')).toBeInTheDocument();
+    expect(screen.getByText('令牌登录')).toBeInTheDocument();
     expect(screen.getByText('OIDC 跳转')).toBeInTheDocument();
   });
 

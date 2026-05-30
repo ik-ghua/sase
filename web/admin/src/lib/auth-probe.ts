@@ -10,7 +10,8 @@
 // 真正颁发 csrf_token 的是**第 2 步非白名单 GET `/platform/tenants`**(经 CSRF middleware GET 分支 Set-Cookie)。
 // 故探活结束(走完第 2 步)后 csrf_token cookie 已就位,后续写方法(POST/PATCH/DELETE)才能带上 X-CSRF-Token。
 //
-// 注:**sase_session 是 HttpOnly cookie**,JS 不能直接读判断已登录,只能靠"调需要认证的 API"。
+// 注:**sase_session 是 HttpOnly cookie**(W2:登录态唯一载体,JS 不能直接读),只能靠"调需要认证的 API"判断;
+// 请求经 credentials:'include' 自动带 cookie(无 localStorage Bearer)。
 import { client } from '@/api/client';
 
 export type ProbeStatus = 'authenticated' | 'unauthenticated' | 'forbidden';
