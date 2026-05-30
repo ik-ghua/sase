@@ -46,6 +46,14 @@ type User = components['schemas']['User'];
 type CompileResult = components['schemas']['CompileResult'];
 type Policy = components['schemas']['Policy'];
 type RiskScore = components['schemas']['RiskScore'];
+type Device = components['schemas']['Device'];
+
+// 设备 status → Tag 颜色映射(pending 默认 / redeemed 绿 / revoked 红)
+const DEVICE_STATUS_COLORS: Record<string, string> = {
+  pending: 'default',
+  redeemed: 'success',
+  revoked: 'error',
+};
 
 // risk level → Tag 颜色映射(与 status Tag 风格一致:low 绿 / medium 橙 / high·critical 红)
 const RISK_LEVEL_COLORS: Record<string, string> = {
@@ -154,6 +162,16 @@ async function fetchUserRisk(tid: string, subject: string): Promise<RiskScore | 
 // 空租户 → [];503(快照持久化未启用)→ 抛 ApiError(UI 显可读提示)。
 async function fetchTenantRisks(tid: string): Promise<RiskScore[]> {
   const { data, error, response } = await client.GET('/api/v1/tenants/{tid}/risk', {
+    params: { path: { tid } },
+  });
+  if (error || !response.ok) throw toApiError(response, error);
+  return data ?? [];
+}
+
+// Slice70:本租户已登记设备(ZTP 可见性,只读;只含非敏感字段,不含激活码)。
+// 后端 handler 用 path tid 做 RLS 上下文,故 platform_admin 可读任意租户。
+async function fetchTenantDevices(tid: string): Promise<Device[]> {
+  const { data, error, response } = await client.GET('/api/v1/tenants/{tid}/devices', {
     params: { path: { tid } },
   });
   if (error || !response.ok) throw toApiError(response, error);
@@ -361,6 +379,12 @@ export default function Tenants() {
   const risksQuery = useQuery({
     queryKey: ['tenant-risks', detailTid],
     queryFn: () => fetchTenantRisks(detailTid),
+    enabled: detailTid !== '',
+  });
+  // Slice70:已登记设备(ZTP)— 与用户/策略区同款懒加载(Drawer 打开才发)。
+  const devicesQuery = useQuery({
+    queryKey: ['tenant-devices', detailTid],
+    queryFn: () => fetchTenantDevices(detailTid),
     enabled: detailTid !== '',
   });
 
@@ -704,6 +728,75 @@ export default function Tenants() {
                         {e ?? '-'}
                       </Tag>
                     ),
+                  },
+                ]}
+              />
+            )}
+
+            {/* Slice70:已登记设备(ZTP;只读;只含非敏感字段,不含激活码)。
+                懒加载,platform_admin 经 path-tid RLS 读目标租户。*/}
+            <Divider>设备(ZTP)</Divider>
+            {devicesQuery.isError ? (
+              <Alert
+                type="error"
+                showIcon
+                message="读取设备失败"
+                description={
+                  devicesQuery.error instanceof Error ? devicesQuery.error.message : undefined
+                }
+              />
+            ) : (
+              <Table<Device>
+                rowKey={(d) => d.id ?? ''}
+                size="small"
+                loading={devicesQuery.isFetching}
+                dataSource={devicesQuery.data ?? []}
+                pagination={{ pageSize: 5, hideOnSinglePage: true, size: 'small' }}
+                locale={{ emptyText: '暂无登记设备' }}
+                columns={[
+                  {
+                    title: '类型',
+                    dataIndex: 'kind',
+                    key: 'kind',
+                    width: 100,
+                    render: (k?: string) => <Tag>{k ?? '-'}</Tag>,
+                  },
+                  {
+                    title: '身份(证书 CN)',
+                    dataIndex: 'identity',
+                    key: 'identity',
+                    ellipsis: true,
+                    render: (v?: string) =>
+                      v ? (
+                        <Tooltip title={v}>
+                          <span style={{ fontFamily: 'var(--font-mono)' }}>{v}</span>
+                        </Tooltip>
+                      ) : (
+                        '-'
+                      ),
+                  },
+                  {
+                    title: '状态',
+                    dataIndex: 'status',
+                    key: 'status',
+                    width: 100,
+                    render: (s?: string) => (
+                      <Tag color={DEVICE_STATUS_COLORS[s ?? ''] ?? 'default'}>{s ?? '-'}</Tag>
+                    ),
+                  },
+                  {
+                    title: '兑换时间',
+                    dataIndex: 'redeemed_at',
+                    key: 'redeemed_at',
+                    width: 170,
+                    render: formatDate,
+                  },
+                  {
+                    title: '创建时间',
+                    dataIndex: 'created_at',
+                    key: 'created_at',
+                    width: 170,
+                    render: formatDate,
                   },
                 ]}
               />

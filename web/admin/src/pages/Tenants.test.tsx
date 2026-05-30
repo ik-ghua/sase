@@ -71,6 +71,10 @@ describe('Tenants 页', () => {
       if (path === '/api/v1/tenants/{tid}/risk') {
         return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
       }
+      // Slice70 设备(ZTP):默认空数组
+      if (path === '/api/v1/tenants/{tid}/devices') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
       return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
     });
   });
@@ -414,5 +418,100 @@ describe('Tenants 页', () => {
     await waitFor(() =>
       expect(screen.getByText('风险快照持久化未启用')).toBeInTheDocument(),
     );
+  });
+
+  // ---- Slice70 设备(ZTP)区 ----
+
+  // path-aware mock:devicesResp 决定 GET /devices 行为;其余区给最小空数据。
+  function mockWithDevices(devicesResp: {
+    data?: unknown;
+    error?: unknown;
+    response: { ok: boolean; status: number };
+  }) {
+    mockGET.mockImplementation((path: string) => {
+      if (path === '/api/v1/tenants/{tid}/users') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/policies/bundle') {
+        return Promise.resolve({ data: null, response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/policies') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/risk/{subject}') {
+        return Promise.resolve({ data: undefined, response: { ok: false, status: 404 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/risk') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/devices') {
+        return Promise.resolve(devicesResp);
+      }
+      return Promise.resolve({ data: [activeTenant], response: { ok: true, status: 200 } });
+    });
+  }
+
+  it('设备区:Drawer 打开懒加载 → 渲染设备行 + status Tag', async () => {
+    mockWithDevices({
+      data: [
+        {
+          id: 'd1',
+          kind: 'cpe',
+          identity: 'site-key-abc',
+          status: 'redeemed',
+          redeemed_at: '2026-05-29T08:00:00Z',
+          created_at: '2026-05-28T08:00:00Z',
+        },
+        {
+          id: 'd2',
+          kind: 'connector',
+          identity: 'conn-app-x',
+          status: 'pending',
+          redeemed_at: null,
+          created_at: '2026-05-28T09:00:00Z',
+        },
+      ],
+      response: { ok: true, status: 200 },
+    });
+    renderWith();
+    await waitFor(() => expect(screen.getByText('TenantA')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /详情/ }));
+    // 设备区标题 + 设备行
+    await waitFor(() => expect(screen.getByText('设备(ZTP)')).toBeInTheDocument());
+    expect(await screen.findByText('site-key-abc')).toBeInTheDocument();
+    expect(screen.getByText('conn-app-x')).toBeInTheDocument();
+    // kind Tag + status Tag
+    expect(screen.getByText('cpe')).toBeInTheDocument();
+    expect(screen.getByText('connector')).toBeInTheDocument();
+    expect(screen.getByText('redeemed')).toBeInTheDocument();
+    expect(screen.getByText('pending')).toBeInTheDocument();
+    // 懒加载发起的是 devices 端点(经 path tid)
+    await waitFor(() =>
+      expect(mockGET).toHaveBeenCalledWith('/api/v1/tenants/{tid}/devices', {
+        params: { path: { tid: activeTenant.id } },
+      }),
+    );
+  });
+
+  it('设备区:空(无登记设备)→ 显「暂无登记设备」', async () => {
+    mockWithDevices({ data: [], response: { ok: true, status: 200 } });
+    renderWith();
+    await waitFor(() => expect(screen.getByText('TenantA')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /详情/ }));
+    await waitFor(() => expect(screen.getByText('设备(ZTP)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('暂无登记设备')).toBeInTheDocument());
+  });
+
+  it('设备区:HTTP 500 → 显读取设备失败 Alert', async () => {
+    mockWithDevices({
+      data: undefined,
+      error: 'internal error',
+      response: { ok: false, status: 500 },
+    });
+    renderWith();
+    await waitFor(() => expect(screen.getByText('TenantA')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /详情/ }));
+    await waitFor(() => expect(screen.getByText('设备(ZTP)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('读取设备失败')).toBeInTheDocument());
   });
 });
