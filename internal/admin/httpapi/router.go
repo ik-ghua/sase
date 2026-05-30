@@ -281,7 +281,7 @@ func getTenant(svc tenant.Service) http.HandlerFunc {
 			return
 		}
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "getTenant", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, t)
@@ -302,7 +302,7 @@ func updateTenant(svc tenant.Service) http.HandlerFunc {
 		case errors.Is(err, tenant.ErrNoPatchFields), errors.Is(err, tenant.ErrInvalidPatch):
 			http.Error(w, err.Error(), http.StatusBadRequest)
 		case err != nil:
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "updateTenant", err)
 		default:
 			writeJSON(w, http.StatusOK, t)
 		}
@@ -334,7 +334,7 @@ func decommissionTenant(svc tenant.Service) http.HandlerFunc {
 		case errors.Is(err, tenant.ErrInvalidPatch):
 			http.Error(w, err.Error(), http.StatusBadRequest)
 		case err != nil:
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "decommissionTenant", err)
 		default:
 			writeJSON(w, http.StatusOK, t)
 		}
@@ -349,7 +349,7 @@ func cancelDecommissionTenant(svc tenant.Service) http.HandlerFunc {
 		case errors.Is(err, tenant.ErrNotDecommissioning):
 			http.Error(w, err.Error(), http.StatusConflict)
 		case err != nil:
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "cancelDecommissionTenant", err)
 		default:
 			writeJSON(w, http.StatusOK, t)
 		}
@@ -371,7 +371,7 @@ func createIDPConfig(svc idp.Service) http.HandlerFunc {
 		case errors.Is(err, secret.ErrNotFound), errors.Is(err, secret.ErrDestroyed):
 			http.Error(w, "tenant DEK not available: "+err.Error(), http.StatusConflict)
 		case err != nil:
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "createIDPConfig", err)
 		default:
 			writeJSON(w, http.StatusCreated, c)
 		}
@@ -382,7 +382,7 @@ func listIDPConfigs(svc idp.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cs, err := svc.List(r.Context(), r.PathValue("tid"))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "listIDPConfigs", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, cs)
@@ -396,7 +396,7 @@ func getIDPConfig(svc idp.Service) http.HandlerFunc {
 		case errors.Is(err, idp.ErrNotFound):
 			http.Error(w, "idp config not found", http.StatusNotFound)
 		case err != nil:
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "getIDPConfig", err)
 		default:
 			writeJSON(w, http.StatusOK, c)
 		}
@@ -418,7 +418,7 @@ func updateIDPConfig(svc idp.Service) http.HandlerFunc {
 		case errors.Is(err, secret.ErrDestroyed):
 			http.Error(w, "tenant DEK destroyed: "+err.Error(), http.StatusConflict)
 		case err != nil:
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "updateIDPConfig", err)
 		default:
 			writeJSON(w, http.StatusOK, c)
 		}
@@ -432,7 +432,7 @@ func deleteIDPConfig(svc idp.Service) http.HandlerFunc {
 		case errors.Is(err, idp.ErrNotFound):
 			http.Error(w, "idp config not found", http.StatusNotFound)
 		case err != nil:
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "deleteIDPConfig", err)
 		default:
 			w.WriteHeader(http.StatusNoContent)
 		}
@@ -445,7 +445,7 @@ func sweepDecommissions(platformSvc platform.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		result, err := platformSvc.RunDecommissionSweep(r.Context())
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "sweepDecommissions", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -582,7 +582,7 @@ func createTenant(svc tenant.Service) http.HandlerFunc {
 			t.ID = uuid.NewString()
 		}
 		if err := svc.Create(r.Context(), &t); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "createTenant", err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, t)
@@ -600,7 +600,7 @@ func createUser(svc identity.Service) http.HandlerFunc {
 			u.ID = uuid.NewString()
 		}
 		if err := svc.Create(r.Context(), &u); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "createUser", err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, u)
@@ -611,7 +611,7 @@ func listUsers(svc identity.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		us, err := svc.ListByTenant(r.Context(), r.PathValue("tid"))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "listUsers", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, us)
@@ -625,7 +625,7 @@ func createPolicy(svc policy.Service) http.HandlerFunc {
 			return
 		}
 		if err := svc.CreatePolicy(r.Context(), r.PathValue("tid"), &p); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "createPolicy", err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, p)
@@ -666,7 +666,7 @@ func getActiveBundle(svc policy.Service) http.HandlerFunc {
 			return
 		}
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "getActiveBundle", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, b)
@@ -680,7 +680,7 @@ func createApp(svc resource.Service) http.HandlerFunc {
 			return
 		}
 		if err := svc.CreateApp(r.Context(), r.PathValue("tid"), &a); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "createApp", err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, a)
@@ -691,7 +691,7 @@ func listApps(svc resource.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		as, err := svc.ListApps(r.Context(), r.PathValue("tid"))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "listApps", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, as)
@@ -705,7 +705,7 @@ func createConnector(svc resource.Service) http.HandlerFunc {
 			return
 		}
 		if err := svc.CreateConnector(r.Context(), r.PathValue("tid"), &c); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "createConnector", err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, c)
@@ -716,7 +716,7 @@ func listConnectors(svc resource.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cs, err := svc.ListConnectors(r.Context(), r.PathValue("tid"))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "listConnectors", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, cs)
@@ -745,7 +745,7 @@ func issueCredential(svc identity.Service) http.HandlerFunc {
 			return
 		}
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "issueCredential", err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]string{"token": token, "jti": jti})
@@ -764,7 +764,7 @@ func revokeCredential(svc identity.Service) http.HandlerFunc {
 			return
 		}
 		if err := svc.RevokeCredential(r.Context(), r.PathValue("tid"), body.JTI, body.Subject, body.Reason); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "revokeCredential", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "jti": body.JTI})
@@ -1084,7 +1084,7 @@ func listAudit(svc audit.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		es, err := svc.ListByTenant(r.Context(), r.PathValue("tid"), 100)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "listAudit", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, es)
@@ -1147,7 +1147,7 @@ func listPlatformTenants(svc platform.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ts, err := svc.ListTenants(r.Context())
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeInternalErr(w, "listPlatformTenants", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, ts)
