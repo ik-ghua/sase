@@ -73,8 +73,8 @@ func runDaemon() error {
 		AgentVersion: agentVersion,
 	}
 
-	// 平台壳(Linux=真 TUN/ip route;非 Linux=unsupported 桩,Run 会返错退出)。
-	ncap, probe, sys := agentd.NewLinuxShells(os.Getenv("AGENT_TUN"), parseMTU(os.Getenv("AGENT_MTU")))
+	// 平台壳(Linux=真 TUN/ip route;macOS=真 utun/route;其余=unsupported 桩,Run 会返错退出)。
+	ncap, probe, sys := agentd.NewPlatformShells(os.Getenv("AGENT_TUN"), parseMTU(os.Getenv("AGENT_MTU")))
 	d := agentd.New(cfg, ncap, probe, sys, nil) // prober=nil → 默认 TCP RTT 探测(不依赖 ICMP)
 
 	log.Printf("[agent] 守护进程启动(version=%s tenant=%s identity=%s 候选PoP=%d)", agentVersion, cfg.Tenant, cfg.Identity, len(cands))

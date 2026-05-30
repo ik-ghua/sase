@@ -200,7 +200,8 @@ func (linuxSystemIntegration) Autostart(enable bool) error {
 	return nil
 }
 
-// NewLinuxShells 是 cmd/agent 装配 Linux 三窄壳的便捷构造(平台壳工厂)。
-func NewLinuxShells(tunName string, mtu int) (NetCapture, PostureProbe, SystemIntegration) {
+// NewPlatformShells 是 cmd/agent 装配 Linux 三窄壳的便捷构造(平台壳工厂,跨平台同名;macOS 见
+// shell_darwin.go、非 Linux/darwin 见 shell_other.go)。
+func NewPlatformShells(tunName string, mtu int) (NetCapture, PostureProbe, SystemIntegration) {
 	return NewLinuxNetCapture(tunName, mtu), NewLinuxPostureProbe(), NewLinuxSystemIntegration()
 }

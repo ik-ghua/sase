@@ -130,7 +130,7 @@ func tcpRTTProbe(ctx context.Context, c PoPCandidate) (time.Duration, error) {
 	return time.Since(start), nil
 }
 
-// New 构造守护进程。net/probe/sys 为平台壳(Linux 见 NewLinuxShells;非 Linux 返回 unsupported 桩)。
+// New 构造守护进程。net/probe/sys 为平台壳(经 NewPlatformShells 跨平台装配:Linux/macOS 真壳,其余返 unsupported 桩)。
 // prober 为 nil 时用默认 TCP RTT 探测(不依赖 ICMP)。
 func New(cfg Config, ncap NetCapture, probe PostureProbe, sys SystemIntegration, prober RTTProber) *Daemon {
 	cfg.withDefaults()
