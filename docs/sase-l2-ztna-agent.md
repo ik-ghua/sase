@@ -249,6 +249,18 @@
 
 **结论** 两条独立链:设备证书续期(复用 `enroll.RunRenewLoop`/`CertRotator` 热轮换)+ 会话凭证刷新(新件调度,参照 RunRenewLoop 范式、经身份子 L2 令牌交换、带最新姿态/risk);撤销/重认证/重采姿态/配置/重选路经终端实时通道(复用 `agent.Session`+`control.Hub`,扩 `config_update`/`reselect_pop` 指令);**权威永在 PoP,通道仅提速,短 TTL 兜底**。
 
+#### 3.6.1 Slice 81 锁定(会话凭证刷新认证模型,花刚 2026-05-30 定)
+
+**TTL 量级差证两链必须独立**:会话 cred TTL 30min(`IssueCredential` 默认,≤1h 上限)vs 设备证书 24h —— cred 刷新远比证书续期频繁,各自独立循环、各自阈值。
+
+锁定的「会错且难改」契约:
+- **刷新认证 = 设备 mTLS + 出示当前签名 cred(双重),免重新 IdP 登录**:Agent 用已持的租户绑定设备证书(role:device,Org=tenant,CN=device-id)mTLS 连 **新端点 `POST /api/v1/agent/session/refresh` @ :8444 设备面**(类比 /renew,与设备证书续期**分链**);**同时出示当前会话 cred**。控制面:① `devpki.TenantFromCert`+CN(device-id)→ 查 `device_enrollments`(RLS)取 `user_id`+status;② **验当前 cred 签名**(`cred.Verifier.Verify`,控制面签发的可信)→ 提取 subject+groups;③ **交叉核对 cred.Subject == device_enrollments.user_id**(设备与 cred 同一用户);④ 三闸:device `status='redeemed'`(未撤销)+ `user_id` 非空 + user `status='active'`(未注销);全过 → `IssueCredential(tenant, user_id, **groups-来自验签 cred**, 最新posture, ttl)` 重签。
+- **⚠️ groups 绝不信客户端 body(防提权)**:重签的 groups **必须来自已验签的当前 cred**(控制面自己签的,可信),**绝不**取请求体里客户端自报的 groups(否则恶意 Agent 谎报高权限组提权)。posture 可来自请求体(Agent 上报事实,本就不可信→姿态非唯一门禁,§3.8);risk 由 `WithRiskSource` 自动填当前快照。groups 动态变更(IdP 改组)第一刀不经刷新反映(沿用入网时签进 cred 的组),需重新 IdP 登录 / SCIM 同步(后续刀)。
+- **刷新门禁 vs EvictRevoked 互补**:刷新查 active+未撤销 = **周期性、自愈**的注销/撤销生效(停用 user/撤销设备 → 刷新失败 → 会话到 deadline ≤30min 自然死);`RevokeCredential`→EvictRevoked = **事件性、秒级**即时拆。撤销 cred 走秒级,停用 user/设备走「刷新门禁 + 短 TTL 兜底」。纵深:刷新校当前 jti 未在吊销表(防被 EvictRevoked 拆的会话靠刷新复活)。
+- **隧道重握手耦合(Slice77 deadline=cred.exp)**:daemon `credStore`(RWMutex 原子替换,类比 CertRotator)在 `cred.exp - refreshLead` 刷新 → 原子更新 SessionTok → **主动触发重握手**(信号让当前 `runTunnelOnce` 返回,retryLoop 用新 cred 重连,跳一次退避)。`runTunnelOnce` 读 `credStore.Token()`(每次握手取最新)。**第一刀「主动重握手有界小 gap」**(非等 deadline,gap≈握手时间,TCP 重传兜底);真 make-before-break(双 tunnel 无缝)留后续刀(PoP 同 srcAddr 重握手是替换不支持并存)。重握手用新 srcAddr(新 UDP socket)建新终结表项,旧项靠 deadline/`RunExpirySweep` 回收。
+- **向后兼容**:`EnrollMode=ztp`(Connector/CPE)无 cred 刷新环(无 per-user cred),设备证书续期 RunRenewLoop→/renew 一行不改;idp 模式并列加 cred 刷新环。
+- **第一刀定界**:make-before-break 无缝(后续)、groups 动态刷新/SCIM(后续)、refresh_token(后续)、并发刷新去重/jitter(后续)、停用 user 秒级(user→jti 反查主动撤销,后续;第一刀靠门禁+deadline)。可测:stub 四态(active/disabled/revoked/no-user)+ 真 PG 集成(入网→刷新→停用 user→刷新 401)。
+
 ---
 
 ### 3.7 PoP 选址:RTT 探测 + 节点动态发现(不硬编码 IP)★
