@@ -3,9 +3,13 @@
 // 动机:私网侧的 App Connector 主动**拨出**连到 PoP 并保持长连;PoP 经这条已建立的连接把
 // 用户请求**反向**送进私网到达应用——私网无需任何入站开口(零暴露面)。
 //
-// Slice 3 协议(最小):连接器拨出 → 发 Hello{tenant,app} 注册 → 之后该连接承载
-// 请求/响应帧(PoP→连接器 Request,连接器→PoP Response),JSON 编码、串行往返(每连接一次一请求)。
-// 加厚目标:多路复用(并发请求)、mTLS 认证连接器、国密隧道(待 PoC-G);本包协议形态可保留。
+// 协议:连接器拨出 → 发 Hello{tenant,app} 注册 → 之后该连接承载请求/响应帧
+// (PoP→连接器 Request,连接器→PoP Response),JSON 编码、串行往返(每连接一次一请求)。
+// 全 HTTP 模型:Request/Response 承载任意 HTTP 方法 + 请求头 + 请求体 + 响应状态码/头/体(见下方结构注释),
+// 真实内网 Web 应用(POST 表单、API、带 header 的请求)可经 ZTNA 访问。body 经 JSON []byte(base64)二进制安全。
+// 诚实边界(本刀有意不做):① body 整包缓冲(非流式 io.Copy,大文件/SSE 留下刀);
+// ② connector.mu 串行(每连接一次一请求,多路复用留下刀);③ 仅 HTTP(任意 TCP 隧道留阶段2)。
+// 加厚目标:多路复用(并发请求)、国密隧道(待 PoC-G);本包协议形态可保留。
 package revtunnel
 
 import (
@@ -16,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 
 	"github.com/ikuai8/sase/internal/devpki"
@@ -27,20 +32,42 @@ type Hello struct {
 	App    string `json:"app"`
 }
 
-// Request 是 PoP 经反向通道发给连接器的请求(slice:GET 语义,无 body)。
+// Request 是 PoP 经反向通道发给连接器的请求。
+//
+// 全 HTTP 模型(承载任意方法 + 请求头 + 请求体):Method/Path 既有;HeaderFull/Body 为本刀新增,
+// 让真实内网 Web 应用(登录表单 POST、API、带 header 的请求)可经 ZTNA 访问。
+//
+// 字段说明:
+//   - Header(map[string]string,既有):保留兼容旧调用方(站点 overlay / cmd/cpe 不填),单值语义。
+//   - HeaderFull(http.Header,新增):多值请求头透传(同名头允许多个,如 Cookie/Accept)。
+//     有 HeaderFull 时连接器优先用它构造上游请求;否则回退 Header。
+//   - Body([]byte,新增):请求体(JSON 编码下 []byte 自动 base64,二进制安全)。本刀缓冲整包(非流式)。
 type Request struct {
-	ID     uint64            `json:"id"`
-	Method string            `json:"method"`
-	Path   string            `json:"path"`
-	Header map[string]string `json:"header,omitempty"`
+	ID         uint64            `json:"id"`
+	Method     string            `json:"method"`
+	Path       string            `json:"path"`
+	Header     map[string]string `json:"header,omitempty"`
+	HeaderFull http.Header       `json:"header_full,omitempty"`
+	Body       []byte            `json:"body,omitempty"`
 }
 
 // Response 是连接器回给 PoP 的响应。
+//
+// 全 HTTP 模型:Status/Body(string,既有)保留兼容站点 overlay / cmd/cpe;Header/BodyBytes 为本刀新增,
+// 承载上游真实响应头与响应体(二进制安全)。
+//
+// 字段说明:
+//   - Status(int,既有)= HTTP 状态码;Body(string,既有)= 旧文本响应体(站点 overlay 仍用)。
+//   - Header(http.Header,新增):上游响应头透传(多值)。
+//   - BodyBytes([]byte,新增):上游响应体(JSON 下 base64,二进制安全)。
+//     全 HTTP 路径(ingress + connector)写回时优先用 BodyBytes;旧路径仍读 Status/Body。
 type Response struct {
-	ID     uint64 `json:"id"`
-	Status int    `json:"status"`
-	Body   string `json:"body"`
-	Err    string `json:"err,omitempty"`
+	ID        uint64      `json:"id"`
+	Status    int         `json:"status"`
+	Body      string      `json:"body"`
+	Header    http.Header `json:"header,omitempty"`
+	BodyBytes []byte      `json:"body_bytes,omitempty"`
+	Err       string      `json:"err,omitempty"`
 }
 
 var ErrNoConnector = errors.New("revtunnel: 该 (tenant,app) 无已注册连接器")

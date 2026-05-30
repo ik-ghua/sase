@@ -5,11 +5,15 @@ package pop_test
 // 需 SASE_DB_RW_DSN(+可选 RO);未设则 SKIP。前置:已应用 migrations/0001+0002。-run TestZTNA。
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -66,12 +70,15 @@ func TestZTNADataPathEndToEnd(t *testing.T) {
 	if err := tenantSvc.Create(ctx, &tenant.Tenant{ID: tid, Name: "TZTNA"}); err != nil {
 		t.Fatalf("建租户: %v", err)
 	}
-	// 资源注册:app1/app2(策略引用,编译校验存在性)
+	// 资源注册:app1/app2/app4(策略引用,编译校验存在性)
 	mustApp(t, resourceSvc, tid, "app1")
 	mustApp(t, resourceSvc, tid, "app2")
-	// 策略:g1 inspect app1(放行但导入 SWG);g1 拒绝 app2;app3 无规则(默认拒绝)
+	mustApp(t, resourceSvc, tid, "app4")
+	// 策略:g1 inspect app1(放行但导入 SWG);g1 拒绝 app2;app3 无规则(默认拒绝);
+	// g1 allow app4(纯放行,无 inspect——用于干净验证全 HTTP 透传:方法/头/体往返不被安全栈干扰)
 	mustPol(t, policySvc, tid, &policy.Policy{Priority: 10, SubjectKind: "group", SubjectValue: "g1", Resource: "app1", Action: "connect", Effect: xdsv1.EffectInspect})
 	mustPol(t, policySvc, tid, &policy.Policy{Priority: 10, SubjectKind: "group", SubjectValue: "g1", Resource: "app2", Action: "connect", Effect: xdsv1.EffectDeny})
+	mustPol(t, policySvc, tid, &policy.Policy{Priority: 10, SubjectKind: "group", SubjectValue: "g1", Resource: "app4", Action: "connect", Effect: xdsv1.EffectAllow})
 	if _, err := policySvc.Compile(ctx, tid); err != nil {
 		t.Fatalf("编译: %v", err)
 	}
@@ -164,6 +171,30 @@ func TestZTNADataPathEndToEnd(t *testing.T) {
 	go func() {
 		_ = revtunnel.Serve(ctx, rawLis.Addr().String(), dataCliTLS, revtunnel.Hello{Tenant: tid, App: "app1"},
 			func(req revtunnel.Request) revtunnel.Response { return proxyTo(ctx, echoSrv.URL, req) })
+	}()
+
+	// reflector 上游(app4 用):回显请求方法 + 指定请求头 + 请求体,并设一个响应头 + 自定义状态码。
+	// 用于验证全 HTTP 模型(任意方法/请求头/请求体/响应状态码/响应头/响应体)端到端往返。
+	reflectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqBody, _ := io.ReadAll(r.Body)
+		w.Header().Set("X-Upstream-Resp", "reflected")
+		// 客户端可经 X-Want-Status 指定期望状态码(默认 201),验证状态码透传。
+		status := http.StatusCreated
+		if v := r.Header.Get("X-Want-Status"); v != "" {
+			if n, e := strconv.Atoi(v); e == nil {
+				status = n
+			}
+		}
+		w.WriteHeader(status)
+		// 回显:方法 / 客户端自定义头 X-Client-Hint(验请求头透传)/ 请求体(验 body 透传)/
+		// 并显式回显是否收到 Authorization(必须为空——验 SASE 凭证被 PoP 剥除,不泄漏给上游)。
+		fmt.Fprintf(w, "method=%s hint=%s authz=%q body=%s",
+			r.Method, r.Header.Get("X-Client-Hint"), r.Header.Get("Authorization"), string(reqBody))
+	}))
+	defer reflectSrv.Close()
+	go func() {
+		_ = revtunnel.Serve(ctx, rawLis.Addr().String(), dataCliTLS, revtunnel.Hello{Tenant: tid, App: "app4"},
+			func(req revtunnel.Request) revtunnel.Response { return proxyTo(ctx, reflectSrv.URL, req) })
 	}()
 
 	// PoP 接入面(HTTPS / mTLS)
@@ -273,6 +304,82 @@ func TestZTNADataPathEndToEnd(t *testing.T) {
 		t.Error("应记录到 dlp_blocked")
 	}
 
+	// ⑩ 全 HTTP 模型(本刀):任意方法 + 请求头 + 请求体 + 响应状态码/头/体端到端往返(app4,纯 allow)。
+	httpTok := tok([]string{"g1"}, 5*time.Minute)
+	// 等 app4 连接器注册就绪
+	waitUntil(t, 5*time.Second, "app4 连接器注册", func() bool {
+		res, _ := agent.Do(ctx, popURL, dataCliTLS, httpTok, agent.Request{App: "app4", Path: "/"})
+		return res.StatusCode != http.StatusBadGateway
+	})
+	// ⑩a POST 带请求体 + 自定义请求头 → 上游收到 method=POST、X-Client-Hint、body;
+	//     且 Authorization(SASE 凭证)被 PoP 剥除(authz="" 验证不泄漏给上游)。
+	res, err := agent.Do(ctx, popURL, dataCliTLS, httpTok, agent.Request{
+		App:    "app4",
+		Path:   "/api/submit",
+		Method: http.MethodPost,
+		Header: http.Header{"X-Client-Hint": {"hello-from-agent"}},
+		Body:   []byte("payload-12345"),
+	})
+	if err != nil {
+		t.Fatalf("全 HTTP POST app4: %v", err)
+	}
+	// ⑩b 响应状态码透传(上游默认 201)
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("响应状态码应透传上游 201,得 %d", res.StatusCode)
+	}
+	// ⑩c 响应头透传
+	if got := res.Header.Get("X-Upstream-Resp"); got != "reflected" {
+		t.Fatalf("响应头 X-Upstream-Resp 应透传,得 %q", got)
+	}
+	// ⑩d 方法 + 请求头 + 请求体透传 + Authorization 被剥除
+	bodyStr := string(res.Body)
+	if !strings.Contains(bodyStr, "method=POST") {
+		t.Errorf("上游应收到 POST 方法,响应体: %q", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "hint=hello-from-agent") {
+		t.Errorf("上游应收到自定义请求头 X-Client-Hint,响应体: %q", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "body=payload-12345") {
+		t.Errorf("上游应收到请求体,响应体: %q", bodyStr)
+	}
+	if !strings.Contains(bodyStr, `authz=""`) {
+		t.Errorf("Authorization(SASE 凭证)必须被 PoP 剥除、不泄漏给上游,响应体: %q", bodyStr)
+	}
+	// ⑩e 自定义响应状态码透传(经 X-Want-Status 指定 418)
+	res2, err := agent.Do(ctx, popURL, dataCliTLS, httpTok, agent.Request{
+		App:    "app4",
+		Path:   "/teapot",
+		Method: http.MethodPut,
+		Header: http.Header{"X-Want-Status": {"418"}},
+	})
+	if err != nil {
+		t.Fatalf("全 HTTP PUT app4: %v", err)
+	}
+	if res2.StatusCode != http.StatusTeapot {
+		t.Fatalf("响应状态码应透传上游 418,得 %d", res2.StatusCode)
+	}
+	if !strings.Contains(string(res2.Body), "method=PUT") {
+		t.Errorf("上游应收到 PUT 方法,响应体: %q", string(res2.Body))
+	}
+
+	// ⑩f DLP 扫请求体(全 HTTP 后 body 可入 DLP):POST 体含 "secret" → app1(inspect)被 block(403)。
+	dlpBefore := dlpSink.count()
+	bodyRes, err := agent.Do(ctx, popURL, dataCliTLS, swgTok, agent.Request{
+		App:    "app1",
+		Path:   "/upload",
+		Method: http.MethodPost,
+		Body:   []byte("here is a secret token"),
+	})
+	if err != nil {
+		t.Fatalf("DLP body POST app1: %v", err)
+	}
+	if bodyRes.StatusCode != http.StatusForbidden {
+		t.Fatalf("DLP 应扫请求体并阻断含 secret 的 body,得 %d", bodyRes.StatusCode)
+	}
+	if dlpSink.count() <= dlpBefore {
+		t.Error("请求体 DLP 命中应喂到 finding sink")
+	}
+
 	// ⑨ 可观测:接入面决策已计入指标(运维 L2 3.4)
 	if rec.AccessValue(metrics.OutcomeInspect) < 1 {
 		t.Error("应记录到 inspect 放行")
@@ -319,19 +426,33 @@ func mustPol(t *testing.T, svc policy.Service, tid string, p *policy.Policy) {
 	}
 }
 
+// proxyTo 是测试连接器:把反向请求(方法 + 头 + 体)真实转发到上游,回填完整响应(状态码 + 头 + 体)。
+// 镜像 cmd/connector.proxy 的全 HTTP 行为。
 func proxyTo(ctx context.Context, upstream string, req revtunnel.Request) revtunnel.Response {
-	r, err := http.NewRequestWithContext(ctx, req.Method, upstream+req.Path, nil)
+	method := req.Method
+	if method == "" {
+		method = http.MethodGet
+	}
+	var body io.Reader
+	if len(req.Body) > 0 {
+		body = bytes.NewReader(req.Body)
+	}
+	r, err := http.NewRequestWithContext(ctx, method, upstream+req.Path, body)
 	if err != nil {
 		return revtunnel.Response{Status: http.StatusBadGateway, Err: err.Error()}
+	}
+	for k, vals := range req.HeaderFull {
+		for _, v := range vals {
+			r.Header.Add(k, v)
+		}
 	}
 	resp, err := http.DefaultClient.Do(r)
 	if err != nil {
 		return revtunnel.Response{Status: http.StatusBadGateway, Err: err.Error()}
 	}
 	defer resp.Body.Close()
-	buf := make([]byte, 4096)
-	n, _ := resp.Body.Read(buf)
-	return revtunnel.Response{Status: resp.StatusCode, Body: string(buf[:n])}
+	b, _ := io.ReadAll(resp.Body)
+	return revtunnel.Response{Status: resp.StatusCode, Header: resp.Header.Clone(), BodyBytes: b, Body: string(b)}
 }
 
 func waitUntil(t *testing.T, timeout time.Duration, what string, cond func() bool) {

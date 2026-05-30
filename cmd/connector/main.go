@@ -7,6 +7,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log"
@@ -91,20 +92,54 @@ func connMaxAge() time.Duration {
 	return time.Hour
 }
 
-// proxy 把反向请求转发到本地上游应用。
+// proxy 把反向请求(全 HTTP:方法 + 头 + 体)转发到本地上游应用,回填完整响应(状态码 + 头 + 体)。
+// body 整包缓冲(本刀非流式)。method 缺省 GET(兼容旧帧)。
 func proxy(ctx context.Context, upstream string, req revtunnel.Request) revtunnel.Response {
-	r, err := http.NewRequestWithContext(ctx, req.Method, upstream+req.Path, nil)
+	method := req.Method
+	if method == "" {
+		method = http.MethodGet
+	}
+	var reqBody io.Reader
+	if len(req.Body) > 0 {
+		reqBody = bytes.NewReader(req.Body)
+	}
+	r, err := http.NewRequestWithContext(ctx, method, upstream+req.Path, reqBody)
 	if err != nil {
 		return revtunnel.Response{Status: http.StatusBadGateway, Err: err.Error()}
+	}
+	// 透传请求头:优先多值 HeaderFull,回退单值 Header(旧帧/站点 overlay)。
+	if len(req.HeaderFull) > 0 {
+		for k, vals := range req.HeaderFull {
+			for _, v := range vals {
+				r.Header.Add(k, v)
+			}
+		}
+	} else {
+		for k, v := range req.Header {
+			r.Header.Set(k, v)
+		}
 	}
 	resp, err := http.DefaultClient.Do(r)
 	if err != nil {
 		return revtunnel.Response{Status: http.StatusBadGateway, Err: err.Error()}
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	return revtunnel.Response{Status: resp.StatusCode, Body: string(body)}
+	// 上游响应体限额缓冲,防恶意/超大上游响应撑爆连接器内存(对称 PoP 侧 16 MiB)。
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxProxyBody))
+	if err != nil {
+		return revtunnel.Response{Status: http.StatusBadGateway, Err: err.Error()}
+	}
+	// 回填完整响应:StatusCode/Header/BodyBytes(全 HTTP);保留 Body=string(body) 兼容旧读取方。
+	return revtunnel.Response{
+		Status:    resp.StatusCode,
+		Header:    resp.Header.Clone(),
+		BodyBytes: body,
+		Body:      string(body),
+	}
 }
+
+// maxProxyBody 是连接器缓冲上游响应体的上限(本刀非流式)。
+const maxProxyBody = 16 << 20 // 16 MiB
 
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
