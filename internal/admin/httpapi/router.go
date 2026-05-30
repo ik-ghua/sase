@@ -954,11 +954,16 @@ func createSite(svc site.Service) http.HandlerFunc {
 	}
 }
 
+// listSites 列出该租户 SD-WAN 站点。handler 用 **path tid 做 RLS 上下文**
+// (platform_admin TenantID 空,经 path-tid RLS 可读任意租户;对齐 listUsers/listDevices/listPolicies 模式)。
+// authz 已守作用域:tenant_admin/auditor 限本租户、platform_admin 任意。
+// 内部错脱敏(log + 通用文案,不泄漏 DB 细节)。
 func listSites(svc site.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ss, err := svc.ListSites(r.Context(), r.PathValue("tid"))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("[admin] listSites tid=%s failed: %v", r.PathValue("tid"), err)
+			http.Error(w, "list sites failed", http.StatusInternalServerError)
 			return
 		}
 		writeJSON(w, http.StatusOK, ss)
