@@ -22,11 +22,13 @@ import (
 // 防恶意/超大上传撑爆 PoP 内存;超限 → 413。大文件/流式上传留下刀(io.Copy 流式隧道)。
 const maxIngressBody = 16 << 20 // 16 MiB
 
-// hopByHopHeaders 是 RFC 7230 §6.1 逐跳头 + 反向通道控制头,转发上游前必须剥除:
+// hopByHopHeaders 是 RFC 7230 §6.1 的静态逐跳头 + 反向通道控制头,转发上游前必须剥除:
 //   - 逐跳头(Connection/Keep-Alive/...)只在单段连接有意义,跨段透传会破坏语义。
 //   - Authorization 是 SASE 会话凭证(app 层认证),绝不能泄漏给内网上游应用。
 //   - X-Sase-* 是 PoP↔Agent 控制头,不进上游。
 //
+// 此外 RFC 7230 §6.1 还有动态逐跳头:Connection 头值点名的字段(如 Connection: X-Foo 里的 X-Foo)
+// 也是本段连接专用的逐跳头,由 connectionHopByHop 逐请求/响应解析(不进本全局 map)。
 // 用 textproto.CanonicalMIMEHeaderKey 归一化比较(http.Header 键已是 canonical)。
 var hopByHopHeaders = func() map[string]bool {
 	keys := []string{
@@ -41,13 +43,41 @@ var hopByHopHeaders = func() map[string]bool {
 	return m
 }()
 
+// connectionHopByHop 解析 src 里的 Connection 头(RFC 7230 §6.1):其值是逗号分隔的字段名列表,
+// 点名的字段在本段连接里同样是逐跳头(动态逐跳头),跨段透传会破坏语义。返回 canonical 化的字段名集合
+// (本次请求/响应专用的局部 set,不污染全局 hopByHopHeaders)。Connection 头本身已在 hopByHopHeaders 静态剥除。
+// 注:故意不把 "Close"/"Keep-Alive" 等连接选项 token 当作字段名特殊处理——它们 canonical 化后不会命中真实业务头,
+// 误加入剥除集也无害(没有名为 Close 的业务头会被透传)。
+func connectionHopByHop(src http.Header) map[string]bool {
+	vals, ok := src["Connection"]
+	if !ok {
+		return nil
+	}
+	var set map[string]bool
+	for _, v := range vals {
+		for _, tok := range strings.Split(v, ",") {
+			tok = strings.TrimSpace(tok)
+			if tok == "" {
+				continue
+			}
+			if set == nil {
+				set = make(map[string]bool)
+			}
+			set[textproto.CanonicalMIMEHeaderKey(tok)] = true
+		}
+	}
+	return set
+}
+
 // filterForwardHeaders 复制 src 头到新 http.Header,剥除逐跳头与 SASE 控制头(Authorization / X-Sase-*)。
+// 含 RFC 7230 §6.1 动态逐跳头:Connection 头值点名的字段一并剥除。
 // 返回的是新 map,不修改入参(并发安全:不与 net/http 共享底层 map)。
 func filterForwardHeaders(src http.Header) http.Header {
+	dynHop := connectionHopByHop(src)
 	out := make(http.Header, len(src))
 	for k, vals := range src {
 		ck := textproto.CanonicalMIMEHeaderKey(k)
-		if hopByHopHeaders[ck] || strings.HasPrefix(ck, "X-Sase-") {
+		if hopByHopHeaders[ck] || dynHop[ck] || strings.HasPrefix(ck, "X-Sase-") {
 			continue
 		}
 		cp := make([]string, len(vals))
@@ -60,9 +90,10 @@ func filterForwardHeaders(src http.Header) http.Header {
 // writeResponse 把反向通道返回的完整响应(状态码/头/体)写回客户端。优先用 BodyBytes(全 HTTP 路径),
 // 回退 Body(旧文本路径)。剥除上游响应里的逐跳头(避免破坏 PoP↔Agent 这段连接的语义)。
 func writeResponse(w http.ResponseWriter, resp revtunnel.Response, inspect bool) {
+	dynHop := connectionHopByHop(resp.Header)
 	for k, vals := range resp.Header {
 		ck := textproto.CanonicalMIMEHeaderKey(k)
-		if hopByHopHeaders[ck] {
+		if hopByHopHeaders[ck] || dynHop[ck] {
 			continue
 		}
 		// Content-Length 由 net/http 据实际写入字节重算,避免与缓冲体长度不一致;不透传上游声明值。

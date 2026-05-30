@@ -178,6 +178,9 @@ func TestZTNADataPathEndToEnd(t *testing.T) {
 	reflectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqBody, _ := io.ReadAll(r.Body)
 		w.Header().Set("X-Upstream-Resp", "reflected")
+		// 响应方向动态逐跳头:点名 X-Resp-Hop 为本段连接逐跳头,PoP 须从回客户端的响应里剥除。
+		w.Header().Set("Connection", "X-Resp-Hop")
+		w.Header().Set("X-Resp-Hop", "should-not-reach-client")
 		// 客户端可经 X-Want-Status 指定期望状态码(默认 201),验证状态码透传。
 		status := http.StatusCreated
 		if v := r.Header.Get("X-Want-Status"); v != "" {
@@ -187,9 +190,11 @@ func TestZTNADataPathEndToEnd(t *testing.T) {
 		}
 		w.WriteHeader(status)
 		// 回显:方法 / 客户端自定义头 X-Client-Hint(验请求头透传)/ 请求体(验 body 透传)/
-		// 并显式回显是否收到 Authorization(必须为空——验 SASE 凭证被 PoP 剥除,不泄漏给上游)。
-		fmt.Fprintf(w, "method=%s hint=%s authz=%q body=%s",
-			r.Method, r.Header.Get("X-Client-Hint"), r.Header.Get("Authorization"), string(reqBody))
+		// 是否收到 Authorization(必须为空——验 SASE 凭证被 PoP 剥除,不泄漏给上游)/
+		// 是否收到 X-Sensitive-Req(被客户端 Connection 头点名 → PoP 须剥除 → 上游应收不到,reqhop="")。
+		fmt.Fprintf(w, "method=%s hint=%s authz=%q body=%s reqhop=%q",
+			r.Method, r.Header.Get("X-Client-Hint"), r.Header.Get("Authorization"), string(reqBody),
+			r.Header.Get("X-Sensitive-Req"))
 	}))
 	defer reflectSrv.Close()
 	go func() {
@@ -378,6 +383,65 @@ func TestZTNADataPathEndToEnd(t *testing.T) {
 	}
 	if dlpSink.count() <= dlpBefore {
 		t.Error("请求体 DLP 命中应喂到 finding sink")
+	}
+
+	// ⑩g RFC 7230 §6.1 动态逐跳头(请求 + 响应两个方向),经真实反向通道往返(app4,纯 allow)。
+	//   请求方向:客户端 Connection: X-Sensitive-Req 点名 → PoP filterForwardHeaders 须剥 X-Sensitive-Req,
+	//             上游收不到(reqhop="")。
+	//   响应方向:上游回 Connection: X-Resp-Hop + X-Resp-Hop → PoP writeResponse 须剥,客户端收不到。
+	hopRes, err := agent.Do(ctx, popURL, dataCliTLS, httpTok, agent.Request{
+		App:    "app4",
+		Path:   "/hop",
+		Method: http.MethodGet,
+		Header: http.Header{
+			"Connection":      {"X-Sensitive-Req"},  // 点名动态逐跳头
+			"X-Sensitive-Req": {"must-be-stripped"}, // 被点名 → PoP 剥除,不达上游
+			"X-Client-Hint":   {"keep-this"},        // 普通业务头,应透传
+		},
+	})
+	if err != nil {
+		t.Fatalf("动态逐跳头 GET app4: %v", err)
+	}
+	hopBody := string(hopRes.Body)
+	// 请求方向:被 Connection 点名的 X-Sensitive-Req 必须被 PoP 剥除,上游收到空(reqhop="")。
+	if !strings.Contains(hopBody, `reqhop=""`) {
+		t.Errorf("请求方向动态逐跳头 X-Sensitive-Req 必须被剥除、不达上游,响应体: %q", hopBody)
+	}
+	// 普通业务头(未被 Connection 点名)仍透传。
+	if !strings.Contains(hopBody, "hint=keep-this") {
+		t.Errorf("未被点名的业务头 X-Client-Hint 应透传,响应体: %q", hopBody)
+	}
+	// 响应方向:上游用 Connection 点名的 X-Resp-Hop 必须被 PoP 从回客户端的响应里剥除。
+	if v := hopRes.Header.Get("X-Resp-Hop"); v != "" {
+		t.Errorf("响应方向动态逐跳头 X-Resp-Hop 必须被剥除,客户端却收到 %q", v)
+	}
+	// 而上游普通响应头仍透传(证明只剥点名字段、不误伤业务响应头)。
+	if v := hopRes.Header.Get("X-Upstream-Resp"); v != "reflected" {
+		t.Errorf("普通响应头 X-Upstream-Resp 应透传,得 %q", v)
+	}
+
+	// ⑪ 超大请求体(>16MiB)→ readBody 限额 → 413,且不转发给上游、不崩进程(回归 W1 readBody e2e)。
+	//   用 app4(纯 allow,无 SWG/DLP),确保 413 来自 body 限额而非安全栈;413 路径在 deny 之后、转发之前。
+	oversized := bytes.Repeat([]byte("A"), (16<<20)+1) // 16 MiB + 1 字节,刚好越限
+	bigRes, err := agent.Do(ctx, popURL, dataCliTLS, httpTok, agent.Request{
+		App:    "app4",
+		Path:   "/big",
+		Method: http.MethodPost,
+		Body:   oversized,
+	})
+	if err != nil {
+		t.Fatalf("超大 body POST app4: %v", err)
+	}
+	if bigRes.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("超大请求体应返 413,得 %d", bigRes.StatusCode)
+	}
+	// 413 是 PoP 本地拒绝(非上游 reflectSrv 的 201),响应体不应含上游反射内容 → 证未转发给上游。
+	if strings.Contains(string(bigRes.Body), "method=POST") {
+		t.Errorf("413 请求绝不应转发给上游(上游反射内容不应出现),响应体: %q", string(bigRes.Body))
+	}
+	// 进程未崩:413 后再发一个正常请求仍能往返(数据面绝不因超大 body 崩)。
+	if st, body, _ := agent.Access(ctx, popURL, dataCliTLS, httpTok, "app4", "/after-413"); st != http.StatusCreated || !strings.Contains(body, "method=GET") {
+		t.Fatalf("413 后接入面应继续可用(不崩进程),得 %d: %q", st, body)
 	}
 
 	// ⑨ 可观测:接入面决策已计入指标(运维 L2 3.4)
