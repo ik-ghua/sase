@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -199,7 +200,9 @@ func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity
 		"GET /api/v1/idp/login":    oidcLogin(oidcDeps),
 		"GET /api/v1/idp/callback": oidcCallback(oidcDeps),
 		// 会话登录/登出(W2):login 验令牌(同 authz 校验)→ 种 HttpOnly sase_session cookie;logout 清 cookie。
-		"POST /api/v1/login":  sessionLogin(authz.NewGuard(verifier)),
+		// R2(Slice74 reviewer 跟进):/login 是未认证公开端点,按来源 IP 限流(同 /enroll、/renew 模式),
+		// 防探测/暴力/资源消耗(签名验证 CPU)。logout 只清自己 cookie(无副作用、幂等),不限流。
+		"POST /api/v1/login":  ratelimit.Wrap(loginLimiter(), ratelimit.ClientIP, sessionLogin(authz.NewGuard(verifier))),
 		"POST /api/v1/logout": sessionLogout(),
 	}
 	assertRouteCoverage(handlers) // fail-loud:handler 集合须与 AdminRoutePatterns 逐条一致(防清单↔实现漂移)
@@ -233,6 +236,39 @@ func Register(mux *http.ServeMux, tenantSvc tenant.Service, identitySvc identity
 	// apiRec=nil 则透传(测试不启用)。
 	routeOf := func(r *http.Request) string { _, pat := api.Handler(r); return pat }
 	mux.Handle("/api/v1/", metrics.HTTPMiddleware(apiRec, routeOf)(chain))
+}
+
+// loginRate/loginBurst 是 /login 限流参数(R2,Slice74 reviewer 跟进)。
+//
+// 速率依据:/login 是人工交互登录(非高频自动化),且令牌为密码学签名不可伪造
+// → 真实威胁是探测/暴力尝试的**资源消耗**(每次验签耗 CPU)而非令牌猜解。
+// 取 burst=10、稳态 0.5/s(≈30 次/分钟/IP):对人(含输错重试/多标签页)足够宽松,
+// 同时把单 IP 自动化 hammer 钳到 ~30/min。比 /enroll(1/5s)宽——登录交互频率天然高于设备入网。
+// 局限同 ratelimit 包:单实例内存计数,多副本不共享(生产网关侧另做分布式限流,本限流为纵深兜底)。
+const (
+	loginRate  = 0.5
+	loginBurst = 10
+)
+
+// loginLimiterOnce/loginLimiterInst 实现进程级 /login 限流器单例。
+//
+// 为何 package-level 单例:Register 签名不含 ctx 且生产/测试会多次调用;
+// 用单例使**整个进程仅一个 /login 限流桶 + 一个 janitor goroutine**,
+// 既避免每次 Register 泄漏 goroutine(测试多次调用),又让多 mux 共享同一 IP 视图。
+var (
+	loginLimiterOnce sync.Once
+	loginLimiterInst *ratelimit.Limiter
+)
+
+// loginLimiter 懒构造进程级 /login 限流器(首次调用启动唯一 janitor)。
+func loginLimiter() *ratelimit.Limiter {
+	loginLimiterOnce.Do(func() {
+		loginLimiterInst = ratelimit.New(loginRate, loginBurst)
+		// janitor:周期淘汰空闲 IP 桶,约束公开端点内存(IP 键不可无界增长)。
+		// context.Background():进程级单例,生命周期=进程;每进程仅此一个 janitor goroutine。
+		loginLimiterInst.StartJanitor(context.Background(), 10*time.Minute, 30*time.Minute)
+	})
+	return loginLimiterInst
 }
 
 // csrfAllowedOriginsFromEnv 从 SASE_CSRF_ALLOWED_ORIGINS 读逗号分隔列表(scheme://host[:port])。
@@ -1219,6 +1255,13 @@ func oidcCallback(deps *oidc.HandlerDeps) http.HandlerFunc {
 	return oidc.CallbackHandler(deps)
 }
 
+// maxLoginBodyBytes 限制 /login 请求体大小(R1,Slice74 W2 reviewer 跟进):
+// /login 是**未认证可达的公开端点**,任何来源都可发请求体;不设上限则 json.Decoder 会把整个
+// body 读进内存,攻击者可用一个超大 body 做未认证内存放大(资源耗尽)。
+// 1 MiB 远大于真实 login 体(`{"token":"<几百字节签名令牌>"}`,通常 < 1 KiB),只截断异常超大输入,
+// 不影响任何正常登录。对齐常见 Web 框架默认 body 上限量级(1 MiB),给排障留足余量。
+const maxLoginBodyBytes = 1 << 20 // 1 MiB
+
 // sessionLogin(W2)用一枚有效 admin 令牌换取 HttpOnly `sase_session` cookie:
 // 把"平台控制台登录态"从前端 localStorage Bearer(自承 XSS 风险)迁到 HttpOnly cookie(JS 不可读)。
 //
@@ -1229,12 +1272,23 @@ func oidcCallback(deps *oidc.HandlerDeps) http.HandlerFunc {
 // 合法 admin 角色校验,不放宽。非法/过期/非 admin 角色令牌 → 401。
 //
 // **token 绝不回响应体**:只进 HttpOnly cookie;响应体仅含非敏感会话信息(role/tenant_id/exp),便前端展示。
+//
+// **R1 body 上限**:r.Body 经 http.MaxBytesReader 收敛到 maxLoginBodyBytes(只在本公开端点单独包,
+// 不动全局 decode,避免波及其它已认证 handler 行为);超限 → 413(*http.MaxBytesError),其它 JSON 错 → 400。
 func sessionLogin(guard *authz.Guard) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxLoginBodyBytes)
 		var body struct {
 			Token string `json:"token"`
 		}
-		if !decode(w, r, &body) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				// 超大 body:未认证内存放大防御。413 与 4xx 既有约定一致(客户端错,可回显类别)。
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 		if body.Token == "" {
