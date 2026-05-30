@@ -75,6 +75,10 @@ describe('Tenants 页', () => {
       if (path === '/api/v1/tenants/{tid}/devices') {
         return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
       }
+      // 站点(SD-WAN):默认空数组
+      if (path === '/api/v1/tenants/{tid}/sites') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
       return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
     });
   });
@@ -258,6 +262,9 @@ describe('Tenants 页', () => {
       if (path === '/api/v1/tenants/{tid}/risk') {
         return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
       }
+      if (path === '/api/v1/tenants/{tid}/sites') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
       return Promise.resolve({ data: [activeTenant], response: { ok: true, status: 200 } });
     });
     renderWith();
@@ -295,6 +302,9 @@ describe('Tenants 页', () => {
       }
       // Slice69 租户级风险概览(list):本组测试聚焦 per-user 懒查列,概览区给空。
       if (path === '/api/v1/tenants/{tid}/risk') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/sites') {
         return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
       }
       return Promise.resolve({ data: [activeTenant], response: { ok: true, status: 200 } });
@@ -363,6 +373,9 @@ describe('Tenants 页', () => {
       }
       if (path === '/api/v1/tenants/{tid}/risk') {
         return Promise.resolve(overviewResp);
+      }
+      if (path === '/api/v1/tenants/{tid}/sites') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
       }
       return Promise.resolve({ data: [activeTenant], response: { ok: true, status: 200 } });
     });
@@ -447,6 +460,9 @@ describe('Tenants 页', () => {
       if (path === '/api/v1/tenants/{tid}/devices') {
         return Promise.resolve(devicesResp);
       }
+      if (path === '/api/v1/tenants/{tid}/sites') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
       return Promise.resolve({ data: [activeTenant], response: { ok: true, status: 200 } });
     });
   }
@@ -513,5 +529,88 @@ describe('Tenants 页', () => {
     fireEvent.click(screen.getByRole('button', { name: /详情/ }));
     await waitFor(() => expect(screen.getByText('设备(ZTP)')).toBeInTheDocument());
     await waitFor(() => expect(screen.getByText('读取设备失败')).toBeInTheDocument());
+  });
+
+  // ---- 站点(SD-WAN)区 ----
+
+  // path-aware mock:sitesResp 决定 GET /sites 行为;其余区给最小空数据。
+  function mockWithSites(sitesResp: {
+    data?: unknown;
+    error?: unknown;
+    response: { ok: boolean; status: number };
+  }) {
+    mockGET.mockImplementation((path: string) => {
+      if (path === '/api/v1/tenants/{tid}/users') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/policies/bundle') {
+        return Promise.resolve({ data: null, response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/policies') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/risk/{subject}') {
+        return Promise.resolve({ data: undefined, response: { ok: false, status: 404 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/risk') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/devices') {
+        return Promise.resolve({ data: [], response: { ok: true, status: 200 } });
+      }
+      if (path === '/api/v1/tenants/{tid}/sites') {
+        return Promise.resolve(sitesResp);
+      }
+      return Promise.resolve({ data: [activeTenant], response: { ok: true, status: 200 } });
+    });
+  }
+
+  it('站点区:Drawer 打开懒加载 → 渲染站点行 + 网段(发起 /sites 端点 path tid)', async () => {
+    mockWithSites({
+      data: [
+        { id: 's1', tenant_id: activeTenant.id, site_key: 'site-bj-01', name: '北京总部', cidr: '10.1.0.0/16' },
+        { id: 's2', tenant_id: activeTenant.id, site_key: 'site-sh-02', name: '上海分支', cidr: '10.2.0.0/16' },
+      ],
+      response: { ok: true, status: 200 },
+    });
+    renderWith();
+    await waitFor(() => expect(screen.getByText('TenantA')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /详情/ }));
+    // 站点区标题 + 站点行
+    await waitFor(() => expect(screen.getByText('站点(SD-WAN)')).toBeInTheDocument());
+    expect(await screen.findByText('site-bj-01')).toBeInTheDocument();
+    expect(screen.getByText('site-sh-02')).toBeInTheDocument();
+    // 名称 + 网段
+    expect(screen.getByText('北京总部')).toBeInTheDocument();
+    expect(screen.getByText('10.1.0.0/16')).toBeInTheDocument();
+    expect(screen.getByText('10.2.0.0/16')).toBeInTheDocument();
+    // 懒加载发起的是 sites 端点(经 path tid)
+    await waitFor(() =>
+      expect(mockGET).toHaveBeenCalledWith('/api/v1/tenants/{tid}/sites', {
+        params: { path: { tid: activeTenant.id } },
+      }),
+    );
+  });
+
+  it('站点区:空(无站点)→ 显「暂无站点」', async () => {
+    mockWithSites({ data: [], response: { ok: true, status: 200 } });
+    renderWith();
+    await waitFor(() => expect(screen.getByText('TenantA')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /详情/ }));
+    await waitFor(() => expect(screen.getByText('站点(SD-WAN)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('暂无站点')).toBeInTheDocument());
+  });
+
+  it('站点区:HTTP 500 → 显「读取站点失败」Alert', async () => {
+    mockWithSites({
+      data: undefined,
+      error: 'internal error',
+      response: { ok: false, status: 500 },
+    });
+    renderWith();
+    await waitFor(() => expect(screen.getByText('TenantA')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: /详情/ }));
+    await waitFor(() => expect(screen.getByText('站点(SD-WAN)')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('读取站点失败')).toBeInTheDocument());
   });
 });

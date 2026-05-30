@@ -47,6 +47,7 @@ type CompileResult = components['schemas']['CompileResult'];
 type Policy = components['schemas']['Policy'];
 type RiskScore = components['schemas']['RiskScore'];
 type Device = components['schemas']['Device'];
+type Site = components['schemas']['Site'];
 
 // 设备 status → Tag 颜色映射(pending 默认 / redeemed 绿 / revoked 红)
 const DEVICE_STATUS_COLORS: Record<string, string> = {
@@ -172,6 +173,16 @@ async function fetchTenantRisks(tid: string): Promise<RiskScore[]> {
 // 后端 handler 用 path tid 做 RLS 上下文,故 platform_admin 可读任意租户。
 async function fetchTenantDevices(tid: string): Promise<Device[]> {
   const { data, error, response } = await client.GET('/api/v1/tenants/{tid}/devices', {
+    params: { path: { tid } },
+  });
+  if (error || !response.ok) throw toApiError(response, error);
+  return data ?? [];
+}
+
+// 本租户已注册站点(SD-WAN,只读)。后端 handler 用 path tid 做 RLS 上下文,
+// 故 platform_admin 经 path-tid RLS 读目标租户(已实现,无需后端改动)。
+async function fetchTenantSites(tid: string): Promise<Site[]> {
+  const { data, error, response } = await client.GET('/api/v1/tenants/{tid}/sites', {
     params: { path: { tid } },
   });
   if (error || !response.ok) throw toApiError(response, error);
@@ -385,6 +396,12 @@ export default function Tenants() {
   const devicesQuery = useQuery({
     queryKey: ['tenant-devices', detailTid],
     queryFn: () => fetchTenantDevices(detailTid),
+    enabled: detailTid !== '',
+  });
+  // 站点(SD-WAN)— 与用户/策略/设备区同款懒加载(Drawer 打开才发)。
+  const sitesQuery = useQuery({
+    queryKey: ['tenant-sites', detailTid],
+    queryFn: () => fetchTenantSites(detailTid),
     enabled: detailTid !== '',
   });
 
@@ -797,6 +814,58 @@ export default function Tenants() {
                     key: 'created_at',
                     width: 170,
                     render: formatDate,
+                  },
+                ]}
+              />
+            )}
+
+            {/* 站点(SD-WAN;只读;懒加载,platform_admin 经 path-tid RLS 读目标租户)。*/}
+            <Divider>站点(SD-WAN)</Divider>
+            {sitesQuery.isError ? (
+              <Alert
+                type="error"
+                showIcon
+                message="读取站点失败"
+                description={
+                  sitesQuery.error instanceof Error ? sitesQuery.error.message : undefined
+                }
+              />
+            ) : (
+              <Table<Site>
+                rowKey={(s) => s.id ?? ''}
+                size="small"
+                loading={sitesQuery.isFetching}
+                dataSource={sitesQuery.data ?? []}
+                pagination={{ pageSize: 5, hideOnSinglePage: true, size: 'small' }}
+                locale={{ emptyText: '暂无站点' }}
+                columns={[
+                  {
+                    title: '站点标识',
+                    dataIndex: 'site_key',
+                    key: 'site_key',
+                    ellipsis: true,
+                    render: (v?: string) =>
+                      v ? (
+                        <Tooltip title={v}>
+                          <span style={{ fontFamily: 'var(--font-mono)' }}>{v}</span>
+                        </Tooltip>
+                      ) : (
+                        '-'
+                      ),
+                  },
+                  {
+                    title: '名称',
+                    dataIndex: 'name',
+                    key: 'name',
+                    ellipsis: true,
+                    render: (v?: string) => v || '-',
+                  },
+                  {
+                    title: '网段',
+                    dataIndex: 'cidr',
+                    key: 'cidr',
+                    render: (v?: string) =>
+                      v ? <span style={{ fontFamily: 'var(--font-mono)' }}>{v}</span> : '-',
                   },
                 ]}
               />
