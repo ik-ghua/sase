@@ -362,6 +362,22 @@
 
 **结论** Agent 入网 = IdP 用户认证(复用现 `internal/oidc`)+ 设备本地 CSR(复用 `devpki.GenerateCSR`,私钥不离设备)→ 控制面签发租户绑定证书(复用 `enroll`/`SignCSR`/`CertRotator`/`RunRenewLoop`)+ 短 TTL 会话凭证 + 配置;Agent 入网触发路径(enroll 扩 `KindAgent` vs 身份子 L2 端点)待确认 LZ11。
 
+#### 3.10.1 Slice 80 锁定(LZ11 定夺 + /agent/enroll 契约 + 引导信任,花刚 2026-05-30 定)
+
+**LZ11 定夺**:两选项工程上收敛 —— **enroll 扩 `KindAgent`**(设备入账本,撤销/续期/可见性复用)**+ 新增编排端点 `POST /api/v1/agent/enroll`**(身份子 L2 形态,**编排** oidc+identity+enroll 三 Service,不塞进激活码语义的 /enroll、不污染浏览器 cookie 的 /idp/callback)。
+
+锁定的「会错且难改」契约:
+- **令牌交换 = loopback redirect + PKCE,client_secret 永不下发设备**:daemon 本地生成 device key+CSR(私钥永不离设备)+ 起 `127.0.0.1:<ephemeral>/callback` listener + PKCE verifier + state → 调系统浏览器(壳 `OpenBrowser`)走 IdP authorize(redirect_uri=loopback,RFC8252 端口可变特例)→ daemon 收 `code` → POST `{code, code_verifier, csr_pem, tenant_id, idp_id, device_id, posture}` 到 `/api/v1/agent/enroll` → **控制面持 client_secret 完成 `adapter.Exchange`(code+verifier→UserInfo)**→ EnsureUser(status=active 闸)→ `enroll.RedeemAgent` 签设备证书 → `identity.IssueCredential` 签 per-user cred → 返回 `{cert_pem, session_token, session_jti, expires_in, user_id}`。
+- **身份分层(不混)**:**设备证书** CN=device-id(本地稳定随机 UUID,与私钥同源)、Org=tenant、OU=role:device —— 一台设备可多用户登录,证书是**设备身份**;**会话凭证** Subject=SASE user.ID、Groups=IdP 组 —— cred 是**用户身份**(PEP principal)。两者正交;device↔user 关联落 `device_enrollments.user_id`(新列,可空;Connector/CPE 为 NULL)。**绝不把 user 编进设备证书 CN**。
+- **引导态信任(首次入网无设备证书,crux)**:transport 用**管理面 server-TLS(预置 CA pin,`devpki.ClientTLSServerOnly`)**——与现 ZTP `DeviceTLS` 引导同信任档;授权信任来自 **IdP id_token(JWKS 验签+aud+iss+exp,在控制面 Exchange)+ PKCE(防 code 截获,仅持 verifier 的 daemon 能换)+ code 一次性**。`/agent/enroll` 是公开端点(authz 白名单 + CSRF skip + IP 限流),**非 mTLS**(引导态本就没设备证书,与激活码 ZTP 对称)。
+- **cert↔cred 双绑定**:同一编排内 EnsureUser 产的 user.ID **同时**用于 `RedeemAgent.user_id` 与 `IssueCredential.Subject`(防设备账本与 cred 主体不一致);设备证书 Org=tenant、cred.TenantID=tenant,PoP `ztnaterm.VerifyCred` 已交叉核对 `claims.TenantID==证书Org`。
+- **PoP PEP 零改**:per-user 入网后 cred 的 Subject/Groups 自动反映真实登录用户/组,Slice77 终结器 PEP 一行不改。
+- **redirect_uri 双注册**:IdP 须注册两个 redirect_uri —— 管理面 callback(SPA 浏览器登录,Slice54)+ daemon loopback(Agent 入网);两路共享 `Exchange`/`EnsureUser` 但 state 各自存(管理面 InMemoryStateStore vs daemon 本地),不冲突。
+- **向后兼容**:`agentd.Config.EnrollMode` 默认 `ztp`(Connector/CPE/现有 demo 激活码不破);`kind` CHECK 加 `agent` 是放宽;`user_id` 可空。
+- **第一刀定界**:仅首次签发 per-user cred;**会话凭证刷新调度(子块7 完整 credstore)、refresh_token、device-code flow(无 GUI/headless)、厂商 IdP 真沙箱 loopback、SCIM 组同步、托盘 GUI 登录** 留后续刀。可测:dex(Slice54 已用)或 httptest mock IdP。
+- **国产 IdP loopback 防线边界(reviewer S4,显注)**:generic OIDC(dex)的 agent loopback 入网 **PKCE 真生效**(IdP 校 code_challenge);但企微/钉钉/飞书 adapter 的 Exchange **忽略 code_verifier/redirect_uri**(无标准 PKCE),其 agent loopback 防线退化为「daemon 本地 state 一次性 + 短窗 + IP 限流 + corpsecret(控制面持)」,**弱于 generic OIDC**。第一刀可测目标是 dex/mock(PKCE 真生效),厂商 IdP 的 loopback 入网防线待真沙箱时复核(可能需服务端 state TakeOnce 补强)。
+- **账本完整性(reviewer S3,后续刀)**:`device_id` 由请求体控制 + `RedeemAgent` upsert 可覆盖同租户他人 device_id 行的 user_id(**非提权**:cred Subject=攻击者、PEP 按攻击者授权、device_id 是本地随机 UUID 难猜;符合「设备证书=设备身份非授权源」)。要强账本完整性可后续:device_id 已绑不同 user_id 时拒覆盖,或 device_id 从 CSR 公钥派生。
+
 ---
 
 ### 3.11 契约与衔接(收口上位 L2 悬留点 + 新增 api/proto)
