@@ -297,8 +297,11 @@ func (d *Daemon) runTunnelOnce(ctx context.Context, tlsConf *tls.Config) error {
 		advAddr = dataConn.LocalAddr().String()
 	}
 
-	// 握手(复用 tunhandshake.Dial:互认证 TLS1.3 + RFC5705 派生 dptunnel.Session;防降级校验 alg)。
-	res, err := tunhandshake.Dial(ctx, pop.HandshakeAddr, tlsConf, d.cfg.Alg, advAddr, d.cfg.Tenant, d.cfg.Identity)
+	// 握手(复用 tunhandshake.DialWithCred:互认证 TLS1.3 + RFC5705 派生 dptunnel.Session;防降级校验 alg)。
+	// **ZTNA 形态(Slice77)**:携会话凭证 SessionTok → PoP 终结器(ZTNA_TUNNEL_ADDR)经 verifyCred hook
+	// 验签 + 交叉核对租户 + 查吊销,验过的 principal(组/姿态/风险)供逐流 PEP。SessionTok 空(未配)时
+	// 等价裸 Dial(连 SD-WAN 形态 PoP 不验 cred,行为不变)。
+	res, err := tunhandshake.DialWithCred(ctx, pop.HandshakeAddr, tlsConf, d.cfg.Alg, advAddr, d.cfg.Tenant, d.cfg.Identity, d.cfg.SessionTok)
 	if err != nil {
 		return fmt.Errorf("握手 PoP %s: %w", pop.Name, err)
 	}

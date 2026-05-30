@@ -39,6 +39,7 @@ import (
 	"github.com/ikuai8/sase/internal/fw"
 	"github.com/ikuai8/sase/internal/metrics"
 	"github.com/ikuai8/sase/internal/pop"
+	"github.com/ikuai8/sase/internal/pop/ztnaterm"
 	"github.com/ikuai8/sase/internal/revtunnel"
 	"github.com/ikuai8/sase/internal/swg"
 	"github.com/ikuai8/sase/internal/telemetry"
@@ -199,11 +200,26 @@ func run() error {
 			log.Printf("[pop-agent] 装载 bundle tenant=%s version=%d (%d 条 L7)", b.TenantID, b.Version, len(b.L7Rules))
 		})
 	})
+	// ZTNA-over-packet 终结器(可选,gated:ZTNA_TUNNEL_ADDR + ZTNA_DATA_ADDR)。先于撤销订阅创建,
+	// 使撤销下发回调能调 term.EvictRevoked(主撤销路径,长连权威闭合,Slice77 §3.1)。不设 → term=nil 不启。
+	var ztnaTerm *ztnaterm.Terminator
+	if os.Getenv("ZTNA_TUNNEL_ADDR") != "" {
+		t, terr := startZTNATermination(ctx, tenantID, verifier, bundles, revoked, rec, serverTLS)
+		if terr != nil {
+			return terr
+		}
+		ztnaTerm = t
+	}
+
 	// ①' 撤销 xDS 订阅(独立流):更新 RevocationStore(秒级失效)。
 	go subscribeLoop(ctx, "revocation", func() error {
 		return pop.SubscribeRevocations(ctx, xdsAddr, xdsTLS, tenantID, node, func(jtis []string) {
 			revoked.Set(tenantID, jtis)
 			log.Printf("[pop-agent] 装载吊销清单 tenant=%s %d 条", tenantID, len(jtis))
+			// 主撤销路径:撤销集更新后,遍历 ZTNA 终结表拆掉 jti 命中的长连 session(秒级权威闭合)。
+			if ztnaTerm != nil {
+				ztnaTerm.EvictRevoked(tenantID)
+			}
 		})
 	})
 	// ①'' SWG 规则 xDS 订阅(独立流):更新 SWGStore(inspect 流量过 URL 过滤)。
@@ -345,6 +361,82 @@ func startSDWANTunnel(ctx context.Context, hsAddr, xdsAddr, tenantID, node strin
 	log.Printf("[pop-agent] SD-WAN 隧道启用:握手 %s(mTLS)/ 数据面 %s(通告 %s)/ 档 %s / FWaaS L4 生效",
 		hsAddr, dataConn.LocalAddr(), advAddr, alg)
 	return nil
+}
+
+// startZTNATermination 起 PoP 侧 ZTNA-over-packet 终结器(Slice77,L2 docs/sase-l2-pop-ztna-termination.md):
+// 握手(mutual TLS1.3 + RFC5705 + **会话凭证验证**,tunhandshake.NewServerWithCred)→ 建会话登终结表 →
+// 收 Agent 隧道包 → 解封 → 逐流 PEP → allow 写 PoP-TUN(内核 SNAT 出站)。共享 verifier/bundles/revoked/rec。
+//
+// 出站后端 = PoP-TUN + 内核 SNAT(§3.4 b):本函数只开 TUN + 读写包;ip_forward/route/MASQUERADE 由
+// 容器 entrypoint 配(deploy/pop-entrypoint.sh)。appResolver 经 ZTNA_APP_RESOLVE env(静态注入,第一刀)。
+func startZTNATermination(ctx context.Context, tenantID string, verifier *cred.Verifier, bundles *pop.BundleStore, revoked *pop.RevocationStore, rec *metrics.Recorder, serverTLS *tls.Config) (*ztnaterm.Terminator, error) {
+	hsAddr := os.Getenv("ZTNA_TUNNEL_ADDR")
+	dataAddr := envOr("ZTNA_DATA_ADDR", ":7300")
+	alg := envOr("ZTNA_TUNNEL_ALG", dptunnel.AlgChaCha20Poly1305)
+	advAddr := os.Getenv("ZTNA_DATA_ADV") // 通告给 Agent 的 PoP 数据面地址(容器须设服务名:端口)
+
+	// appResolver:目的(tenant,dstCIDR[:port])→ appKey(=PEP resource)。静态注入(第一刀,§3.4)。
+	// ZTNA_APP_RESOLVE="tenant=cidr[:port]=appKey;…"(分号分隔多条;空 → 任何目的解析不出资源 → 全 deny)。
+	apps := ztnaterm.NewAppResolver()
+	for _, spec := range strings.Split(os.Getenv("ZTNA_APP_RESOLVE"), ";") {
+		if spec = strings.TrimSpace(spec); spec == "" {
+			continue
+		}
+		if err := apps.AddSpec(spec); err != nil {
+			return nil, fmt.Errorf("解析 ZTNA_APP_RESOLVE: %w", err)
+		}
+		log.Printf("[pop-agent] ZTNA appResolver 规则: %s", spec)
+	}
+
+	// PoP 侧 TUN(allow 内层包写入 → 内核 SNAT;回程从此读)。需 CAP_NET_ADMIN + /dev/net/tun(同 CPE)。
+	tun, tunName, err := dptunnel.OpenTUN(envOr("ZTNA_TUN", "saze0"))
+	if err != nil {
+		return nil, fmt.Errorf("打开 ZTNA PoP-TUN(需 CAP_NET_ADMIN): %w", err)
+	}
+	log.Printf("[pop-agent] ZTNA PoP-TUN=%s 就绪(allow 内层包经此出站,内核 SNAT)", tunName)
+
+	sessionCap := time.Hour
+	if v := os.Getenv("ZTNA_SESSION_CAP"); v != "" {
+		if d, perr := time.ParseDuration(v); perr == nil && d > 0 {
+			sessionCap = d
+		}
+	}
+	term := ztnaterm.New(verifier, bundles, revoked, apps, tun, rec, sessionCap)
+
+	// 数据面 UDP 监听 + Serve(入向 worker pool + 回程 pump)。
+	dataConn, err := net.ListenPacket("udp", dataAddr)
+	if err != nil {
+		return nil, fmt.Errorf("监听 ZTNA 数据面 %s: %w", dataAddr, err)
+	}
+	go term.Serve(ctx, dataConn)
+	go term.RunExpirySweep(ctx, time.Minute) // deadline 兜底闸的主动回收(惰性检查已覆盖来包路径)
+
+	if advAddr == "" {
+		advAddr = dataConn.LocalAddr().String()
+	}
+	// 握手服务:NewServerWithCred 挂 term.VerifyCred(入口闸:验签 + 交叉核对租户 + 查吊销),
+	// onEstablished 经 term.Establish 登入终结表。本 cmd 单租户:拒他租户证书。
+	srv := tunhandshake.NewServerWithCred(advAddr, alg, func(e tunhandshake.Established) {
+		if e.Tenant != tenantID {
+			log.Printf("[pop-agent] 拒绝 ZTNA 握手:证书租户 %s 与本 PoP 租户 %s 不符", e.Tenant, tenantID)
+			return
+		}
+		term.Establish(e.Tenant, e.Claims, e.CPEDataAddr, e.Session)
+	}, term.VerifyCred)
+
+	rawHs, err := net.Listen("tcp", hsAddr)
+	if err != nil {
+		return nil, fmt.Errorf("监听 ZTNA 握手 %s: %w", hsAddr, err)
+	}
+	hsLn := tls.NewListener(rawHs, serverTLS) // mutual TLS(校验 Agent ZTP 证书取 tenant)
+	go func() {
+		if e := srv.Serve(ctx, hsLn); e != nil && ctx.Err() == nil {
+			log.Printf("[pop-agent] ZTNA 握手监听结束: %v", e)
+		}
+	}()
+	log.Printf("[pop-agent] ZTNA 终结启用:握手 %s(mTLS+cred)/ 数据面 %s(通告 %s)/ 档 %s / PoP-TUN %s",
+		hsAddr, dataConn.LocalAddr(), advAddr, alg, tunName)
+	return term, nil
 }
 
 // fetchPubkey 经管理面 HTTPS 取签发公钥(GET /api/v1/trust/pubkey → {"alg":..,"pubkey": base64url})。

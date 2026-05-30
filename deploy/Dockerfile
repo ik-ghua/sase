@@ -33,7 +33,9 @@ RUN go build -trimpath -ldflags "-s -w" -o /out/app ./cmd/${CMD}
 # 供 healthcheck 与 init 容器编排(devpki 容器要写共享 certs volume)。
 # iproute2:SD-WAN CPE 容器演示需 `ip` 给 TUN 配 IP/路由(busybox 的 ip 不全;装完整 iproute2)。
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates wget iproute2
+# iproute2:SD-WAN CPE / ZTNA Agent·PoP 容器给 TUN 配 IP/路由。
+# iptables:Slice77 PoP 容器出站 SNAT(MASQUERADE);curl:Agent 容器端到端演示(curl 内部 app)。
+RUN apk add --no-cache ca-certificates wget iproute2 iptables curl
 WORKDIR /app
 COPY --from=build /out/app /app/app
 # 默认以 root 运行:devpki init 容器需写 root 拥有的共享 certs volume,且写出的私钥为 0600(仅 owner 可读);

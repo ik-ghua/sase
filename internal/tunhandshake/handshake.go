@@ -20,6 +20,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/ikuai8/sase/internal/cred"
 	"github.com/ikuai8/sase/internal/devpki"
 	"github.com/ikuai8/sase/internal/dptunnel"
 )
@@ -38,9 +39,13 @@ const handshakeTimeout = 10 * time.Second
 
 // clientHello 是 CPE→PoP 控制消息:CPE 的数据面 UDP 地址(PoP 回程目的)。
 // 注:tenant/site 不信任本消息,以已认证证书为准(site 仅供交叉核对)。
+//
+// Cred 是可选的会话凭证 token(ZTNA 形态:Agent 携 SessionTok,PoP 经 verifyCred hook 验签 + 交叉核对
+// 租户绑定;见 NewServerWithCred / Slice77 L2 §3.1)。SD-WAN CPE 不填(空)、PoP 不设 hook → 旧行为不变。
 type clientHello struct {
 	DataAddr string `json:"data_addr"`
 	Site     string `json:"site"`
+	Cred     string `json:"cred,omitempty"`
 }
 
 // serverHello 是 PoP→CPE 控制消息:PoP 数据面 UDP 地址 + 算法档 + epoch(防降级:档由控制面定,CPE 校验)。
@@ -90,6 +95,12 @@ type Established struct {
 	Alg         string
 	Key         []byte
 	CPEDataAddr *net.UDPAddr // CPE 数据面 UDP 地址(PoP 回程目的;非 NAT 下 == 数据报 srcAddr)
+
+	// Claims 是握手时刻验过的会话凭证声明(仅 ZTNA 形态:Server 配了 verifyCred hook 才填;
+	// SD-WAN 形态 hook 为 nil → 零值)。终结器据此连同 session/srcAddr 存入终结表(Slice77 L2 §3.1)。
+	// **安全契约**:此字段仅在 Server 成功 Verify(签名+有效期)+ 交叉核对租户后才有值;Verify 失败的
+	// 握手已被拒(连接关闭),绝不会以零值/未验证 Claims 透出。
+	Claims cred.Claims
 }
 
 // Session 用本端方向构造 dptunnel 会话(PoP 侧:send=PoP→CPE、recv=CPE→PoP)。
@@ -107,11 +118,25 @@ type Server struct {
 	alg           string            // 算法档(控制面据租户策略定;不在握手协商,防降级)
 	epoch         uint32            // 本刀恒 0;rekey/epoch 为后续刀(派生与 serverHello 通告须同源,见 handle 注释 B1)
 	onEstablished func(Established) // 握手成功回调(上层建 Session + Router.Register)
+
+	// verifyCred 是可选的会话凭证验证 hook(ZTNA 形态,Slice77):非 nil 时,handle 在取证书身份后、
+	// onEstablished 前,用它对 clientHello.Cred 验签 + 有效期 + 撤销;返回的 Claims 须已与证书租户交叉核对、
+	// fail-closed(返 error 即拒握手关连接)。nil(SD-WAN 形态)→ 不验 cred、行为与旧 NewServer 完全一致。
+	// 入参 certTenant = 已认证证书的租户(Org/W9),供 hook 内交叉核对 claims.TenantID == certTenant。
+	verifyCred func(certTenant, token string, now time.Time) (cred.Claims, error)
 }
 
-// NewServer 构造握手服务。popDataAddr=PoP 数据面 UDP 地址;alg=算法档;onEstablished=成功回调。
+// NewServer 构造握手服务(SD-WAN 形态:不验 cred)。popDataAddr=PoP 数据面 UDP 地址;alg=算法档;
+// onEstablished=成功回调。**保持现有 SD-WAN 调用点(cmd/pop-agent / cmd/cpe)编译/运行零改**。
 func NewServer(popDataAddr, alg string, onEstablished func(Established)) *Server {
 	return &Server{popDataAddr: popDataAddr, alg: alg, epoch: 0, onEstablished: onEstablished}
+}
+
+// NewServerWithCred 构造带会话凭证验证的握手服务(ZTNA 形态,Slice77 L2 §3.1)。
+// verifyCred 不可为 nil(否则用 NewServer);它须 fail-closed 验签 + 有效期 + 撤销 + 交叉核对租户,
+// 返 error 即拒握手。验过的 Claims 随 Established 透出供终结器逐流 PEP。
+func NewServerWithCred(popDataAddr, alg string, onEstablished func(Established), verifyCred func(certTenant, token string, now time.Time) (cred.Claims, error)) *Server {
+	return &Server{popDataAddr: popDataAddr, alg: alg, epoch: 0, onEstablished: onEstablished, verifyCred: verifyCred}
 }
 
 // Serve 在 ln(已配 mutual-TLS server 配置)上接受握手连接,直到 ctx 取消。
@@ -157,6 +182,19 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		log.Printf("[tunhandshake] 拒绝握手:hello.site=%q 与证书 CN=%q 不符", ch.Site, site)
 		return
 	}
+	// ZTNA 形态(Slice77 §3.1 入口闸):配了 verifyCred 即必须验会话凭证 —— 验签 + 有效期 + 交叉核对租户 +
+	// 查吊销,全部 fail-closed(hook 返 error 即拒握手关连接,绝不以未验/零值 Claims 透出)。
+	// SD-WAN 形态(verifyCred==nil)跳过本块,行为与旧 NewServer 一致;此时即便 CPE 误带 Cred 也不被消费。
+	var claims cred.Claims
+	if s.verifyCred != nil {
+		c, verr := s.verifyCred(tenant, ch.Cred, time.Now())
+		if verr != nil {
+			// 失败不泄漏细节(签名/过期/撤销/租户不符统一拒),仅本地留痕便于排障。
+			log.Printf("[tunhandshake] 拒绝 ZTNA 握手 tenant=%s site=%s:会话凭证校验失败: %v", tenant, site, verr)
+			return
+		}
+		claims = c
+	}
 	cpeAddr, err := net.ResolveUDPAddr("udp", ch.DataAddr)
 	if err != nil {
 		log.Printf("[tunhandshake] 拒绝握手 tenant=%s site=%s:CPE 数据地址 %q 非法: %v", tenant, site, ch.DataAddr, err)
@@ -172,7 +210,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	}
 	// 先登记会话(Router.Register)再回 serverHello:确保 CPE 收到 hello 开始发数据时,PoP 已可解复用该会话,
 	// 否则 CPE 早发的包因 bySrc 未命中被丢(竞态)。
-	s.onEstablished(Established{Tenant: tenant, Site: site, Alg: s.alg, Key: key, CPEDataAddr: cpeAddr})
+	s.onEstablished(Established{Tenant: tenant, Site: site, Alg: s.alg, Key: key, CPEDataAddr: cpeAddr, Claims: claims})
 	if err := json.NewEncoder(conn).Encode(serverHello{DataAddr: s.popDataAddr, Alg: s.alg, Epoch: epoch}); err != nil {
 		return
 	}
@@ -196,12 +234,20 @@ func (r Result) Session() (*dptunnel.Session, error) {
 	return dptunnel.NewSession(aead, 0, dirCPEToPoP, dirPoPToCPE), nil
 }
 
-// Dial 是 CPE 侧:用 ZTP 设备证书向 PoP 发起 mutual-TLS 握手,派生数据面密钥。
+// Dial 是 CPE 侧(SD-WAN 形态):用 ZTP 设备证书向 PoP 发起 mutual-TLS 握手,派生数据面密钥。
 //
 //	handshakeAddr = PoP 握手 TCP 地址;tlsConf = 设备 mTLS 客户端配置(含 ZTP 证书 + 验 PoP);
 //	alg = 期望算法档(控制面下发,与 PoP 校验防降级);myDataAddr = CPE 数据面 UDP 本地地址;
 //	tenant/site = 本端身份(供 PoP 交叉核对;权威仍是证书)。
+//
+// **SD-WAN 调用点(cmd/cpe / agentd SD-WAN 路径)签名零改**:不携会话凭证(PoP 也不验)。
 func Dial(ctx context.Context, handshakeAddr string, tlsConf *tls.Config, alg, myDataAddr, tenant, site string) (Result, error) {
+	return DialWithCred(ctx, handshakeAddr, tlsConf, alg, myDataAddr, tenant, site, "")
+}
+
+// DialWithCred 是 CPE/Agent 侧:同 Dial,但在 clientHello 携带会话凭证 token(ZTNA 形态,Slice77)。
+// PoP 端配了 verifyCred hook 时会对其验签 + 有效期 + 交叉核对租户 + 查吊销;cred 空 → 等价 Dial(SD-WAN)。
+func DialWithCred(ctx context.Context, handshakeAddr string, tlsConf *tls.Config, alg, myDataAddr, tenant, site, sessionTok string) (Result, error) {
 	d := tls.Dialer{Config: tlsConf}
 	dctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
@@ -215,7 +261,7 @@ func Dial(ctx context.Context, handshakeAddr string, tlsConf *tls.Config, alg, m
 	tc := conn.(*tls.Conn)
 	cs := tc.ConnectionState()
 
-	if err := json.NewEncoder(conn).Encode(clientHello{DataAddr: myDataAddr, Site: site}); err != nil {
+	if err := json.NewEncoder(conn).Encode(clientHello{DataAddr: myDataAddr, Site: site, Cred: sessionTok}); err != nil {
 		return Result{}, fmt.Errorf("tunhandshake.Dial: 发 hello: %w", err)
 	}
 	var sh serverHello

@@ -32,3 +32,4 @@
 # 外部/参考资料(非本仓代码:clean-room 不入库 + 体量大)
 /tools/
 /.tmp-open-design/
+/issue-session
